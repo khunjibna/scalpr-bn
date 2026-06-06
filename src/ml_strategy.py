@@ -1,5 +1,8 @@
 """Machine Learning Strategy — Random Forest Classifier"""
 import os
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=FutureWarning)
 from datetime import datetime
 
 import joblib
