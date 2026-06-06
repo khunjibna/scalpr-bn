@@ -12,6 +12,9 @@ Usage examples:
 """
 import argparse
 import sys
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 from pathlib import Path
 
 import yaml
@@ -66,6 +69,7 @@ def main():
     parser.add_argument("--config",   default="config.yaml")
     parser.add_argument("--plot",     action="store_true",  help="Plot equity curve")
     parser.add_argument("--no-cache", action="store_true",  help="Re-download data")
+    parser.add_argument("--export",   action="store_true",  help="Copy trained model to rf_*.pkl for live bot")
     args = parser.parse_args()
 
     config   = _load_config(args.config)
@@ -99,6 +103,20 @@ def main():
             result = backtester.run(df, symbol)
             print_report(result)
             all_results.append(result)
+
+            # Export model to live bot if requested
+            if args.export:
+                import shutil
+                src_model  = Path(f"models/bt_{symbol.lower()}.pkl")
+                src_scaler = Path(f"models/bt_{symbol.lower()}_scaler.pkl")
+                dst_model  = Path(f"models/rf_{symbol.lower()}.pkl")
+                dst_scaler = Path(f"models/rf_{symbol.lower()}_scaler.pkl")
+                if src_model.exists() and src_scaler.exists():
+                    shutil.copy2(src_model,  dst_model)
+                    shutil.copy2(src_scaler, dst_scaler)
+                    logger.info(f"Exported {symbol} model → {dst_model} (trained on 4y data)")
+                else:
+                    logger.warning(f"Model file not found for {symbol}, skipping export")
 
             if args.plot:
                 _plot_equity(result, symbol)

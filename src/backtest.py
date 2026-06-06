@@ -105,6 +105,7 @@ class Backtester:
         equity      = [balance]
         open_trade: Optional[Trade] = None
         trades:     list[Trade]     = []
+        entry_bar_i: int            = 0   # bar index when position opened
 
         sl_pct    = self.risk_cfg.get("stop_loss_pct",    0.004)
         rr        = self.risk_cfg.get("take_profit_ratio", 1.5)
@@ -112,38 +113,43 @@ class Backtester:
         max_hold  = self.config.get("strategy", {}).get("max_hold_candles", 10)
         conf_thr  = self.config.get("ml", {}).get("confidence_threshold", 0.60)
 
-        for i in range(1, len(test_df)):
-            bar   = test_df.iloc[i]
-            price = bar["close"]
-            ts    = test_df.index[i]
-            window = test_df.iloc[max(0, i - 100): i + 1]
+        # Pre-extract numpy arrays for fast bar access
+        closes  = test_df["close"].values
+        highs   = test_df["high"].values
+        lows    = test_df["low"].values
+        index   = test_df.index
+        n_bars  = len(test_df)
+        log_every = max(1, n_bars // 20)   # progress every 5%
+
+        for i in range(1, n_bars):
+            if i % log_every == 0:
+                logger.info(f"Simulating {symbol}: {i/n_bars*100:.0f}% ({i:,}/{n_bars:,} bars) | trades={len(trades)} balance=${balance:,.0f}")
+
+            price = closes[i]
+            high  = highs[i]
+            low   = lows[i]
+            ts    = index[i]
 
             # ── Check open trade ──────────────────────────────────────────────
             if open_trade is not None:
-                t = open_trade
+                t   = open_trade
                 hit = None
                 if t.side == "LONG":
-                    if bar["low"]  <= t.stop_loss:   hit = ("SL", t.stop_loss)
-                    elif bar["high"] >= t.take_profit: hit = ("TP", t.take_profit)
+                    if low  <= t.stop_loss:    hit = ("SL", t.stop_loss)
+                    elif high >= t.take_profit: hit = ("TP", t.take_profit)
                 else:
-                    if bar["high"] >= t.stop_loss:   hit = ("SL", t.stop_loss)
-                    elif bar["low"]  <= t.take_profit: hit = ("TP", t.take_profit)
+                    if high >= t.stop_loss:    hit = ("SL", t.stop_loss)
+                    elif low  <= t.take_profit: hit = ("TP", t.take_profit)
 
-                # Time-stop
-                if hit is None and max_hold > 0:
-                    bars_held = i - list(test_df.index).index(t.entry_time) \
-                        if t.entry_time in test_df.index else max_hold
-                    if bars_held >= max_hold:
-                        hit = ("TIME", price)
+                # Time-stop — use bar index diff (O(1))
+                if hit is None and max_hold > 0 and (i - entry_bar_i) >= max_hold:
+                    hit = ("TIME", price)
 
                 if hit:
                     reason, exit_px = hit
-                    if t.side == "LONG":
-                        pnl = (exit_px - t.entry_price) * t.qty * self.leverage
-                    else:
-                        pnl = (t.entry_price - exit_px) * t.qty * self.leverage
+                    pnl = ((exit_px - t.entry_price) if t.side == "LONG"
+                           else (t.entry_price - exit_px)) * t.qty * self.leverage
                     pnl_pct = pnl / balance * 100
-
                     t.exit_time   = ts
                     t.exit_price  = exit_px
                     t.exit_reason = reason
@@ -157,18 +163,18 @@ class Backtester:
                 equity.append(balance)
                 continue
 
-            # ── Generate signal ────────────────────────────────────────────────
-            ind_signal = get_signal_from_indicators(window, self.config)
+            # ── Generate signal (every bar, no slicing overhead) ──────────────
+            window = test_df.iloc[max(0, i - 100): i + 1]
+            ind_signal           = get_signal_from_indicators(window, self.config)
             ml_signal, confidence = ml.predict(window)
 
-            # Both must agree
             signal = ml_signal if (ind_signal == ml_signal != 0) else 0
             if signal == 0 or confidence < conf_thr:
                 equity.append(balance)
                 continue
 
             # ── Size the trade ────────────────────────────────────────────────
-            side = "LONG" if signal == 1 else "SHORT"
+            side    = "LONG" if signal == 1 else "SHORT"
             sl_dist = price * sl_pct
             sl  = price - sl_dist if side == "LONG" else price + sl_dist
             tp  = price + sl_dist * rr if side == "LONG" else price - sl_dist * rr
@@ -189,6 +195,7 @@ class Backtester:
                 stop_loss=sl, take_profit=tp,
                 ml_confidence=confidence,
             )
+            entry_bar_i = i
             equity.append(balance)
 
         # Force-close any open position at last bar

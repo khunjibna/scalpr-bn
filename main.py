@@ -14,6 +14,9 @@ Usage:
 """
 import argparse
 import sys
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 
 import yaml
 from dotenv import load_dotenv
