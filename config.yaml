@@ -1,0 +1,53 @@
+trading:
+  # ── Scalping mode ──────────────────────────────────────────────────────────
+  # รอบสั้น 1m candle, ถือ position แค่ 2-10 นาที
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+    - BNBUSDT
+    - DOGEUSDT
+  timeframe: 1m             # 1m สำหรับ scalping (3m ก็ได้ถ้า noise เยอะเกิน)
+  leverage: 10
+  margin_type: ISOLATED
+  testnet: true
+
+risk:
+  max_position_pct: 0.02    # 2% = $200/เทรด
+  stop_loss_pct: 0.004      # SL แคบ 0.4% (scalping ต้องตัดขาดทุนไว)
+  take_profit_ratio: 1.5    # TP 1.5:1 — เป้าเล็กแต่ทำบ่อย
+  max_daily_loss_pct: 0.06  # หยุดถ้าขาดทุนเกิน 6%/วัน
+  max_open_positions: 1
+
+strategy:
+  # ── ใช้ EMA เร็วกว่าปกติสำหรับ scalping ──────────────────────────────────
+  ema_fast: 3               # EMA 3 (ตอบสนองเร็วมาก)
+  ema_slow: 8               # EMA 8
+  ema_trend: 21             # EMA 21 (filter trend)
+  rsi_period: 7             # RSI 7 (เร็วกว่า 14)
+  rsi_oversold: 30
+  rsi_overbought: 70
+  macd_fast: 6              # MACD เร็วขึ้น
+  macd_slow: 13
+  macd_signal: 4
+
+  # ── Scalping-specific ─────────────────────────────────────────────────────
+  volume_spike_mult: 1.5    # volume spike ≥ 1.5× avg = confirm signal
+  max_hold_candles: 10      # บังคับปิด position ถ้าถือเกิน 10 candle (10 นาที)
+
+ml:
+  model_path: models/rf_model.pkl
+  retrain_hours: 6          # retrain บ่อยขึ้น (data 1m เปลี่ยนเร็ว)
+  lookback_candles: 1500
+  min_train_samples: 150      # ลดลงให้ train ได้ด้วย 1500 candle × 1m
+  lookahead_candles: 3      # predict 3 candle ข้างหน้า (3 นาที)
+  confidence_threshold: 0.60
+  n_estimators: 200
+
+dashboard:
+  host: 0.0.0.0
+  port: 8080
+
+bot:
+  loop_interval_seconds: 10  # ตรวจสัญญาณทุก 10 วินาที
+  klines_limit: 300
