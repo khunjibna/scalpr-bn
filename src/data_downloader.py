@@ -35,7 +35,16 @@ def _download_month(symbol: str, interval: str, year: int, month: int) -> pd.Dat
     with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
         csv_name = z.namelist()[0]
         with z.open(csv_name) as f:
-            df = pd.read_csv(f, header=None)
+            first = f.read(200).decode("utf-8", errors="ignore")
+            f.seek(0) if hasattr(f, "seek") else None
+
+        # Re-open to read properly
+        with z.open(csv_name) as f:
+            has_header = first.lstrip().startswith("open_time") or first.lstrip().startswith("Open")
+            df = pd.read_csv(
+                f,
+                header=0 if has_header else None,
+            )
 
     df.columns = [
         "open_time", "open", "high", "low", "close", "volume",
