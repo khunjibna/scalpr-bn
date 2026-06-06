@@ -1,0 +1,284 @@
+"""
+Backtesting Engine
+==================
+Walks through historical OHLCV bar-by-bar using the same
+indicators + ML strategy as the live bot.
+
+Train/test split:
+  - First 70%  → train ML model
+  - Last  30%  → out-of-sample test (walk-forward friendly)
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from loguru import logger
+
+from .indicators import calculate_indicators, get_signal_from_indicators
+from .ml_strategy import MLStrategy
+
+
+# ── Data classes ──────────────────────────────────────────────────────────────
+
+@dataclass
+class Trade:
+    entry_time:    pd.Timestamp
+    symbol:        str
+    side:          str          # LONG | SHORT
+    entry_price:   float
+    qty:           float
+    stop_loss:     float
+    take_profit:   float
+    ml_confidence: float
+    exit_time:     Optional[pd.Timestamp] = None
+    exit_price:    Optional[float]        = None
+    exit_reason:   str                    = ""
+    pnl:           float                  = 0.0
+    pnl_pct:       float                  = 0.0
+
+
+@dataclass
+class BacktestResult:
+    symbol:          str
+    interval:        str
+    start:           str
+    end:             str
+    initial_balance: float
+    final_balance:   float
+    total_return_pct: float
+    trades:          list[Trade]   = field(default_factory=list)
+
+    # Computed metrics (filled by analyse())
+    n_trades:         int   = 0
+    n_wins:           int   = 0
+    n_losses:         int   = 0
+    win_rate:         float = 0.0
+    avg_win_pct:      float = 0.0
+    avg_loss_pct:     float = 0.0
+    profit_factor:    float = 0.0
+    max_drawdown_pct: float = 0.0
+    sharpe_ratio:     float = 0.0
+    equity_curve:     list  = field(default_factory=list)
+
+
+# ── Engine ────────────────────────────────────────────────────────────────────
+
+class Backtester:
+    def __init__(self, config: dict, initial_balance: float = 10_000.0):
+        self.config          = config
+        self.initial_balance = initial_balance
+        self.risk_cfg        = config.get("risk", {})
+        self.trading_cfg     = config.get("trading", {})
+        self.leverage        = self.trading_cfg.get("leverage", 10)
+
+    def run(self, df_raw: pd.DataFrame, symbol: str) -> BacktestResult:
+        """
+        Run backtest on a full historical DataFrame.
+        df_raw must have OHLCV columns (no indicators yet).
+        """
+        logger.info(f"Computing indicators for {symbol} ({len(df_raw):,} candles)…")
+        df = calculate_indicators(df_raw, self.config)
+        if df.empty:
+            raise ValueError("Indicator calculation returned empty DataFrame")
+
+        # ── Train / test split ────────────────────────────────────────────────
+        split = int(len(df) * 0.70)
+        train_df = df.iloc[:split]
+        test_df  = df.iloc[split:]
+
+        logger.info(f"Train: {len(train_df):,} candles | Test: {len(test_df):,} candles")
+        logger.info(f"Train period: {train_df.index[0].date()} → {train_df.index[-1].date()}")
+        logger.info(f"Test  period: {test_df.index[0].date()}  → {test_df.index[-1].date()}")
+
+        ml = MLStrategy(self.config)
+        ml.ml_cfg["model_path"] = f"models/bt_{symbol.lower()}.pkl"
+        ok = ml.train_model(train_df)
+        if not ok:
+            logger.warning("ML training failed — running indicator-only signals")
+
+        # ── Walk through test bars ────────────────────────────────────────────
+        balance     = self.initial_balance
+        equity      = [balance]
+        open_trade: Optional[Trade] = None
+        trades:     list[Trade]     = []
+
+        sl_pct    = self.risk_cfg.get("stop_loss_pct",    0.004)
+        rr        = self.risk_cfg.get("take_profit_ratio", 1.5)
+        risk_frac = self.risk_cfg.get("max_position_pct", 0.02)
+        max_hold  = self.config.get("strategy", {}).get("max_hold_candles", 10)
+        conf_thr  = self.config.get("ml", {}).get("confidence_threshold", 0.60)
+
+        for i in range(1, len(test_df)):
+            bar   = test_df.iloc[i]
+            price = bar["close"]
+            ts    = test_df.index[i]
+            window = test_df.iloc[max(0, i - 100): i + 1]
+
+            # ── Check open trade ──────────────────────────────────────────────
+            if open_trade is not None:
+                t = open_trade
+                hit = None
+                if t.side == "LONG":
+                    if bar["low"]  <= t.stop_loss:   hit = ("SL", t.stop_loss)
+                    elif bar["high"] >= t.take_profit: hit = ("TP", t.take_profit)
+                else:
+                    if bar["high"] >= t.stop_loss:   hit = ("SL", t.stop_loss)
+                    elif bar["low"]  <= t.take_profit: hit = ("TP", t.take_profit)
+
+                # Time-stop
+                if hit is None and max_hold > 0:
+                    bars_held = i - list(test_df.index).index(t.entry_time) \
+                        if t.entry_time in test_df.index else max_hold
+                    if bars_held >= max_hold:
+                        hit = ("TIME", price)
+
+                if hit:
+                    reason, exit_px = hit
+                    if t.side == "LONG":
+                        pnl = (exit_px - t.entry_price) * t.qty * self.leverage
+                    else:
+                        pnl = (t.entry_price - exit_px) * t.qty * self.leverage
+                    pnl_pct = pnl / balance * 100
+
+                    t.exit_time   = ts
+                    t.exit_price  = exit_px
+                    t.exit_reason = reason
+                    t.pnl         = pnl
+                    t.pnl_pct     = pnl_pct
+                    balance      += pnl
+                    balance       = max(balance, 0.01)
+                    open_trade    = None
+                    trades.append(t)
+
+                equity.append(balance)
+                continue
+
+            # ── Generate signal ────────────────────────────────────────────────
+            ind_signal = get_signal_from_indicators(window, self.config)
+            ml_signal, confidence = ml.predict(window)
+
+            # Both must agree
+            signal = ml_signal if (ind_signal == ml_signal != 0) else 0
+            if signal == 0 or confidence < conf_thr:
+                equity.append(balance)
+                continue
+
+            # ── Size the trade ────────────────────────────────────────────────
+            side = "LONG" if signal == 1 else "SHORT"
+            sl_dist = price * sl_pct
+            sl  = price - sl_dist if side == "LONG" else price + sl_dist
+            tp  = price + sl_dist * rr if side == "LONG" else price - sl_dist * rr
+
+            risk_amt = balance * risk_frac
+            qty      = risk_amt / sl_dist
+            margin   = qty * price / self.leverage
+            if margin > balance * 0.20:
+                qty = (balance * 0.20 * self.leverage) / price
+
+            if qty * price < 5:
+                equity.append(balance)
+                continue
+
+            open_trade = Trade(
+                entry_time=ts, symbol=symbol, side=side,
+                entry_price=price, qty=qty,
+                stop_loss=sl, take_profit=tp,
+                ml_confidence=confidence,
+            )
+            equity.append(balance)
+
+        # Force-close any open position at last bar
+        if open_trade is not None:
+            last_price = test_df["close"].iloc[-1]
+            t = open_trade
+            pnl = ((last_price - t.entry_price) if t.side == "LONG"
+                   else (t.entry_price - last_price)) * t.qty * self.leverage
+            t.exit_time   = test_df.index[-1]
+            t.exit_price  = last_price
+            t.exit_reason = "END"
+            t.pnl         = pnl
+            t.pnl_pct     = pnl / balance * 100
+            balance      += pnl
+            trades.append(t)
+
+        result = BacktestResult(
+            symbol          = symbol,
+            interval        = self.trading_cfg.get("timeframe", "1m"),
+            start           = str(test_df.index[0].date()),
+            end             = str(test_df.index[-1].date()),
+            initial_balance = self.initial_balance,
+            final_balance   = balance,
+            total_return_pct= (balance - self.initial_balance) / self.initial_balance * 100,
+            trades          = trades,
+            equity_curve    = equity,
+        )
+        return _analyse(result)
+
+
+# ── Metrics ───────────────────────────────────────────────────────────────────
+
+def _analyse(r: BacktestResult) -> BacktestResult:
+    trades = r.trades
+    if not trades:
+        return r
+
+    pnls     = [t.pnl for t in trades]
+    wins     = [p for p in pnls if p > 0]
+    losses   = [p for p in pnls if p < 0]
+
+    r.n_trades    = len(trades)
+    r.n_wins      = len(wins)
+    r.n_losses    = len(losses)
+    r.win_rate    = len(wins) / len(trades) * 100 if trades else 0
+    r.avg_win_pct = np.mean([t.pnl_pct for t in trades if t.pnl > 0]) if wins   else 0
+    r.avg_loss_pct= np.mean([t.pnl_pct for t in trades if t.pnl < 0]) if losses else 0
+
+    gross_profit = sum(wins)
+    gross_loss   = abs(sum(losses))
+    r.profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    # Max drawdown
+    eq  = np.array(r.equity_curve)
+    peak = np.maximum.accumulate(eq)
+    dd   = (peak - eq) / peak * 100
+    r.max_drawdown_pct = float(dd.max())
+
+    # Sharpe (annualised, assumes 1m candles → 525,600 bars/year)
+    returns = np.diff(eq) / eq[:-1]
+    if returns.std() > 0:
+        bars_per_year = 525_600
+        r.sharpe_ratio = float(returns.mean() / returns.std() * math.sqrt(bars_per_year))
+
+    return r
+
+
+def print_report(r: BacktestResult):
+    sep = "─" * 52
+    print(f"\n{sep}")
+    print(f"  BACKTEST REPORT  {r.symbol} {r.interval}")
+    print(sep)
+    print(f"  Period          {r.start} → {r.end}")
+    print(f"  Initial balance ${r.initial_balance:,.2f}")
+    print(f"  Final balance   ${r.final_balance:,.2f}")
+    print(f"  Total return    {r.total_return_pct:+.2f}%")
+    print(sep)
+    print(f"  Trades          {r.n_trades}")
+    print(f"  Win rate        {r.win_rate:.1f}%  ({r.n_wins}W / {r.n_losses}L)")
+    print(f"  Avg win         {r.avg_win_pct:+.2f}%")
+    print(f"  Avg loss        {r.avg_loss_pct:+.2f}%")
+    print(f"  Profit factor   {r.profit_factor:.2f}")
+    print(f"  Max drawdown    {r.max_drawdown_pct:.2f}%")
+    print(f"  Sharpe ratio    {r.sharpe_ratio:.2f}")
+    print(sep)
+
+    # Exit reason breakdown
+    from collections import Counter
+    reasons = Counter(t.exit_reason for t in r.trades)
+    print("  Exit reasons:")
+    for reason, cnt in sorted(reasons.items()):
+        print(f"    {reason:<10} {cnt}")
+    print(sep + "\n")
