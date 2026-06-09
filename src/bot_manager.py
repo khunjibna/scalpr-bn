@@ -6,6 +6,7 @@ import threading
 from loguru import logger
 
 from .binance_client import BinanceClient
+from .database import TradeDB
 from .indicators import calculate_indicators
 from .trader import TradingBot
 
@@ -27,13 +28,17 @@ class BotManager:
         # One shared Binance client for all bots
         self._client = BinanceClient(testnet=use_testnet)
 
+        # Shared SQLite DB (all bots write to the same file)
+        db_path = config.get("database", {}).get("path", "data/trades.db")
+        self._db = TradeDB(db_path)
+
         self.bots: dict[str, TradingBot] = {}
         for symbol in symbols:
             sym_config = copy.deepcopy(config)
             sym_config["trading"]["symbol"] = symbol
             # Each bot gets its own ML model path so models don't clash
             sym_config["ml"]["model_path"] = f"models/rf_{symbol.lower()}.pkl"
-            self.bots[symbol] = TradingBot(sym_config, client=self._client)
+            self.bots[symbol] = TradingBot(sym_config, client=self._client, db=self._db)
             logger.info(f"Bot registered: {symbol}")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -68,6 +73,8 @@ class BotManager:
         total_daily_pnl  = 0.0
         total_daily_loss = 0.0
         running_count    = 0
+        any_halted       = False
+        halt_reasons     = []
 
         for symbol, bot in self.bots.items():
             s = bot.get_status()
@@ -76,6 +83,11 @@ class BotManager:
             total_daily_loss     += s.get("daily_loss", 0.0)
             if s.get("status") == "running":
                 running_count += 1
+            if s.get("trading_halted"):
+                any_halted = True
+                reason = s.get("halt_reason", "")
+                if reason:
+                    halt_reasons.append(f"{symbol}: {reason}")
 
         return {
             "balance":       balance,
@@ -85,14 +97,13 @@ class BotManager:
             "symbols":       per_symbol,
             "bot_count":     len(self.bots),
             "running_count": running_count,
+            "any_halted":    any_halted,
+            "halt_reason":   " | ".join(halt_reasons),
         }
 
     def get_all_trades(self) -> list:
-        trades: list[dict] = []
-        for bot in self.bots.values():
-            trades.extend(bot.trade_history)
-        trades.sort(key=lambda t: t.get("time", ""), reverse=True)
-        return trades[:100]
+        """Fetch recent trades from SQLite (persists across restarts)."""
+        return self._db.get_trades(limit=100)
 
     def get_chart(self, symbol: str) -> list:
         bot = self.bots.get(symbol)

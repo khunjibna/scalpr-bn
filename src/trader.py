@@ -1,19 +1,24 @@
-"""Core Trading Bot"""
+"""Core Trading Bot — V2 Production
+Integrates kill-switch, signal expiry, equity tracking, and rolling P&L feedback.
+"""
 import os
 import threading
 import time
 from datetime import datetime
 
 from loguru import logger
+from sklearn import get_config
+from sklearn.utils.parallel import Parallel  # noqa: F401 – ensures sklearn parallel is registered
 
 from .binance_client import BinanceClient
+from .database import TradeDB
 from .indicators import calculate_indicators, get_signal_from_indicators
 from .ml_strategy import MLStrategy
 from .risk_manager import RiskManager
 
 
 class TradingBot:
-    def __init__(self, config: dict, client: BinanceClient = None):
+    def __init__(self, config: dict, client: BinanceClient = None, db: TradeDB | None = None):
         self.config      = config
         self.trading_cfg = config.get("trading", {})
         self.bot_cfg     = config.get("bot", {})
@@ -33,6 +38,9 @@ class TradingBot:
         self.strategy = MLStrategy(config)
         self.risk     = RiskManager(config)
 
+        # SQLite persistence
+        self.db: TradeDB | None = db
+
         # Shared state (guarded by _lock)
         self._lock          = threading.Lock()
         self._running       = False
@@ -40,16 +48,24 @@ class TradingBot:
         self.current_signal = 0
         self.ml_confidence  = 0.0
         self.ind_signal     = 0
-        self.trade_history: list[dict] = []
+        # Seed in-memory cache from DB (survives restarts)
+        self.trade_history: list[dict] = (
+            self.db.get_trades(100, self.symbol) if self.db else []
+        )
         self.last_update: datetime | None = None
         self.error_message  = ""
 
         self.step_size = 0.001
-        self._position_open_time: datetime | None = None  # for max_hold_candles
+        self._position_open_time: datetime | None = None
         # Software SL/TP tracker: {symbol: {"sl": float, "tp": float, "side": str, "qty": float}}
         self._sltp: dict = {}
         self._use_exchange_orders = not self.trading_cfg.get("testnet", False) and \
             os.getenv("USE_TESTNET", "false").lower() != "true"
+
+        # V2: signal expiry tracking
+        self._last_signal_time: datetime | None = None
+        self._signal_expiry_seconds: int = self.bot_cfg.get("signal_expiry_seconds", 300)
+
         self._setup_symbol()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -107,19 +123,65 @@ class TradingBot:
                 logger.warning("Indicator DataFrame empty after calculation")
                 return
 
-            # Retrain if due (run in background thread to avoid blocking the cycle)
-            if self.strategy.needs_retraining():
-                logger.info("Retraining ML model …")
+            # V2: update equity peak for portfolio drawdown guard
+            balance = self.client.get_futures_balance()
+            self.risk.update_equity(balance)
+
+            # V2: kill-switch check every cycle — early-return silently if already halted
+            if self.risk.trading_halted:
+                self.error_message = f"KILL-SWITCH: {self.risk._halt_reason}"
+                return
+
+            _det = self.strategy.drift_detector
+            _min_obs = self.strategy.ml_cfg.get("drift_min_obs", 30)
+            drift_score = _det.rolling_score() if len(_det._history) >= _min_obs else 0.0
+            ks_triggered, ks_reason = self.risk.check_kill_switch(
+                balance=balance,
+                ml_drift_score=drift_score,
+                exchange_connected=True,
+            )
+            if ks_triggered:
+                logger.critical(f"Kill-switch triggered — halting: {ks_reason}")
+                self.error_message = f"KILL-SWITCH: {ks_reason}"
+                return
+
+            # ── Initial blocking train (first startup, no model on disk) ────
+            if not self.strategy.is_trained:
+                logger.info("No model found — training on current data before trading …")
+                success = self.strategy.train_model(df.copy())
+                if not success:
+                    logger.warning("Initial training failed — will retry next cycle")
+                    return  # skip this cycle; try again next iteration
+
+            # ── Scheduled / performance-triggered retrain (background) ───────
+            elif self.strategy.needs_retraining():
+                logger.info("Scheduled retrain — launching background thread …")
+                # Capture sklearn config from the current thread so it propagates
+                # into joblib workers (suppresses sklearn parallel config warning)
+                _sk_cfg = get_config()
+                def _retrain(strategy, data, sk_cfg):
+                    from sklearn import config_context
+                    with config_context(**sk_cfg):
+                        strategy.train_model(data)
                 t = threading.Thread(
-                    target=self.strategy.train_model,
-                    args=(df.copy(),),
+                    target=_retrain,
+                    args=(self.strategy, df.copy(), _sk_cfg),
                     daemon=True,
                 )
                 t.start()
 
             # Signals
-            self.ind_signal           = get_signal_from_indicators(df, self.config)
+            self.ind_signal               = get_signal_from_indicators(df, self.config)
             ml_signal, self.ml_confidence = self.strategy.predict(df)
+
+            # V2: signal expiry — discard stale signals
+            now = datetime.now()
+            if ml_signal != 0:
+                self._last_signal_time = now
+            elif (self._last_signal_time is not None
+                  and (now - self._last_signal_time).total_seconds()
+                      > self._signal_expiry_seconds):
+                self._last_signal_time = None
 
             # Both indicators and ML must agree
             self.current_signal = (
@@ -129,7 +191,8 @@ class TradingBot:
             price = df["close"].iloc[-1]
             logger.info(
                 f"Cycle | price={price:.2f} | ind={self.ind_signal} | "
-                f"ml={ml_signal}({self.ml_confidence:.2f}) | signal={self.current_signal}"
+                f"ml={ml_signal}({self.ml_confidence:.2f}) | signal={self.current_signal} | "
+                f"drift={drift_score:.4f}"
             )
 
             self._manage_positions(df)
@@ -155,7 +218,7 @@ class TradingBot:
             return
 
         for pos in positions:
-            pnl = float(pos.get("unrealizedProfit", 0))
+            pnl = float(pos.get("unRealizedProfit", 0))
             amt = float(pos["positionAmt"])
             logger.info(
                 f"Position | amt={amt} "
@@ -179,13 +242,17 @@ class TradingBot:
                     close_side = "SELL" if amt > 0 else "BUY"
                     self.client.close_position(self.symbol, close_side, abs(amt))
                     self.risk.record_trade(pnl)
+                    # V2: feed realized PnL to ml_strategy rolling tracker
+                    self.strategy.record_trade_result(pnl)
                     del self._sltp[self.symbol]
                     self._position_open_time = None
-                    # Mark latest trade as closed
+                    # Mark latest trade as closed in memory + DB
                     for t in reversed(self.trade_history):
                         if t["symbol"] == self.symbol and t["status"] == "OPEN":
                             t["status"] = hit
                             t["pnl"]    = pnl
+                            if self.db:
+                                self.db.close_trade(t["uid"], hit, pnl)
                             break
                     return
 
@@ -201,8 +268,17 @@ class TradingBot:
                     close_side = "SELL" if amt > 0 else "BUY"
                     self.client.close_position(self.symbol, close_side, abs(amt))
                     self.risk.record_trade(pnl)
+                    self.strategy.record_trade_result(pnl)  # V2: rolling perf feedback
                     self._sltp.pop(self.symbol, None)
                     self._position_open_time = None
+                    # Mark latest OPEN trade as TIME STOP in memory + DB
+                    for t in reversed(self.trade_history):
+                        if t["symbol"] == self.symbol and t["status"] == "OPEN":
+                            t["status"] = "TIME STOP"
+                            t["pnl"]    = pnl
+                            if self.db:
+                                self.db.close_trade(t["uid"], "TIME STOP", pnl)
+                            break
 
     # ── Signal execution ──────────────────────────────────────────────────────
 
@@ -281,7 +357,9 @@ class TradingBot:
 
         self._position_open_time = datetime.now()
 
-        self.trade_history.append({
+        import uuid as _uuid
+        trade_record = {
+            "uid":           str(_uuid.uuid4()),
             "id":            order.get("orderId", ""),
             "time":          datetime.now().isoformat(),
             "symbol":        self.symbol,
@@ -293,30 +371,47 @@ class TradingBot:
             "ml_confidence": self.ml_confidence,
             "status":        "OPEN",
             "pnl":           0.0,
-        })
+        }
+        self.trade_history.append(trade_record)
         # Keep only last 100 trades in memory
         self.trade_history = self.trade_history[-100:]
+        # Persist to SQLite
+        if self.db:
+            self.db.save_trade(trade_record)
 
     # ── Dashboard data ────────────────────────────────────────────────────────
 
     def get_status(self) -> dict:
         positions = self.client.get_positions(self.symbol)
         daily     = self.risk.get_daily_stats()
+        rolling   = self.strategy.get_rolling_metrics()
+        val_m     = self.strategy.get_last_validation_metrics()
         return {
-            "status":           self.status,
-            "symbol":           self.symbol,
-            "timeframe":        self.timeframe,
-            "leverage":         self.leverage,
-            "current_price":    self.client.get_price(self.symbol),
-            "signal":           self.current_signal,
-            "ml_confidence":    self.ml_confidence,
-            "indicator_signal": self.ind_signal,
-            "positions":        positions,
-            "daily_pnl":        daily["daily_pnl"],
-            "daily_loss":       daily["daily_loss"],
-            "ml_trained":       self.strategy.is_trained,
-            "last_update":      self.last_update.isoformat() if self.last_update else None,
-            "error":            self.error_message,
+            "status":             self.status,
+            "symbol":             self.symbol,
+            "timeframe":          self.timeframe,
+            "leverage":           self.leverage,
+            "current_price":      self.client.get_price(self.symbol),
+            "signal":             self.current_signal,
+            "ml_confidence":      self.ml_confidence,
+            "indicator_signal":   self.ind_signal,
+            "positions":          positions,
+            "daily_pnl":          daily["daily_pnl"],
+            "daily_loss":         daily["daily_loss"],
+            "trading_halted":     daily["trading_halted"],
+            "halt_reason":        daily["halt_reason"],
+            "ml_trained":         self.strategy.is_trained,
+            "last_update":        self.last_update.isoformat() if self.last_update else None,
+            "error":              self.error_message,
+            # V2 rolling performance
+            "rolling_sharpe":     rolling.get("rolling_sharpe"),
+            "rolling_win_rate":   rolling.get("rolling_win_rate"),
+            "drift_score":        rolling.get("drift_score"),
+            # V2 last validation metrics
+            "val_sharpe":         val_m.get("val_sharpe"),
+            "val_acc":            val_m.get("val_acc"),
+            "val_gates_passed":   val_m.get("gates_passed"),
+            "val_gate_failures":  val_m.get("gate_failures"),
         }
 
 

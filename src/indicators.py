@@ -1,12 +1,17 @@
-"""Technical Indicators using the `ta` library"""
+"""Technical Indicators using the `ta` library — V2 Production"""
+import numpy as np
 import pandas as pd
 import ta
+
+# V2 feature schema version — increment when features change
+FEATURE_SCHEMA_VERSION = "2.1"
 
 
 def calculate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     """
     Add all technical indicator columns to the OHLCV DataFrame.
     Drops NaN rows resulting from lookback windows.
+    V2: Adds log_return, zscore_close_64, ema_spread_12_26, price_slope_20, atr_14.
     """
     cfg = config.get("strategy", {})
     df = df.copy()
@@ -20,6 +25,24 @@ def calculate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     df["ema_fast"]  = ta.trend.EMAIndicator(close, window=cfg.get("ema_fast",  3)).ema_indicator()
     df["ema_slow"]  = ta.trend.EMAIndicator(close, window=cfg.get("ema_slow",  8)).ema_indicator()
     df["ema_trend"] = ta.trend.EMAIndicator(close, window=cfg.get("ema_trend", 21)).ema_indicator()
+
+    # V2: EMA 12/26 spread (standard MACD baseline)
+    ema12 = ta.trend.EMAIndicator(close, window=12).ema_indicator()
+    ema26 = ta.trend.EMAIndicator(close, window=26).ema_indicator()
+    df["ema_spread_12_26"] = ema12 - ema26
+
+    # V2: Linear regression slope over 20 bars (price trend direction/strength)
+    def _rolling_slope(series: pd.Series, window: int) -> pd.Series:
+        x = np.arange(window)
+        x_mean = x.mean()
+        ss_xx = ((x - x_mean) ** 2).sum()
+        slopes = series.rolling(window).apply(
+            lambda y: ((x - x_mean) * (y.values - y.values.mean())).sum() / ss_xx,
+            raw=False,
+        )
+        return slopes
+
+    df["price_slope_20"] = _rolling_slope(close, 20)
 
     # Approximate VWAP using cumulative (tp × vol) / cumvol over rolling 20
     typical_price = (high + low + close) / 3
@@ -43,7 +66,8 @@ def calculate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     df["stoch_d"] = stoch.stoch_signal()
 
     # ── Volatility ───────────────────────────────────────────────────────────
-    df["atr"] = ta.volatility.AverageTrueRange(high, low, close, window=7).average_true_range()
+    df["atr"]    = ta.volatility.AverageTrueRange(high, low, close, window=7).average_true_range()
+    df["atr_14"] = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range()
 
     bb = ta.volatility.BollingerBands(close, window=14, window_dev=2)
     df["bb_upper"] = bb.bollinger_hband()
@@ -55,7 +79,10 @@ def calculate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     df["vol_ratio"]  = vol / vol_ma   # > spike_mult → volume surge
     df["vol_delta"]  = vol - vol.shift(1)  # volume momentum
 
-    # ── Derived features ─────────────────────────────────────────────────────
+    # ── Derived / V2 features ─────────────────────────────────────────────────
+    # V2: Log return (causal, 1-bar) — preferred over pct_change for ML models
+    df["log_return"] = np.log(close / close.shift(1))
+
     df["return_1"] = close.pct_change(1)
     df["return_3"] = close.pct_change(3)
     df["return_5"] = close.pct_change(5)
@@ -67,6 +94,10 @@ def calculate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 
     # Candle body ratio (large body = strong directional move)
     df["body_ratio"] = (close - df["open"]).abs() / (high - low + 1e-9)
+
+    # V2: 64-bar z-score of close (mean-reversion signal)
+    roll64 = close.rolling(64)
+    df["zscore_close_64"] = (close - roll64.mean()) / (roll64.std() + 1e-9)
 
     df.dropna(inplace=True)
     return df

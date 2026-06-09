@@ -9,6 +9,7 @@ def create_app(manager, config: dict) -> Flask:
     manager: BotManager instance
     """
     app = Flask(__name__, template_folder="../templates")
+    app.config['TEMPLATES_AUTO_RELOAD'] = True
     CORS(app)
 
     # ── Pages ─────────────────────────────────────────────────────────────────

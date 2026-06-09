@@ -15,6 +15,8 @@
       --border:     #30363d;
       --green:      #3fb950;
       --red:        #f85149;
+      --yellow:     #d29922;
+      --blue:       #1f6feb;
       --muted:      #8b949e;
     }
     body          { background: var(--bg-base); color: #c9d1d9; font-size: .88rem; }
@@ -23,42 +25,102 @@
     .card-header  { background: var(--bg-surface); border-bottom: 1px solid var(--border); font-weight: 600; }
     .stat-box     { background: var(--bg-surface); border-radius: 8px; padding: 10px 12px; }
     #chart-wrap   { height: 380px; }
-    .sym-card     { cursor: pointer; transition: border-color .2s; }
-    .sym-card:hover, .sym-card.active { border-color: #1f6feb !important; }
+    .sym-card     { cursor: pointer; transition: border-color .2s, box-shadow .2s; }
+    .sym-card:hover { border-color: var(--blue) !important; box-shadow: 0 0 0 1px var(--blue)22; }
+    .sym-card.active { border-color: var(--blue) !important; box-shadow: 0 0 0 2px var(--blue)44; }
     .sig-long     { color: var(--green); }
     .sig-short    { color: var(--red); }
     .sig-neutral  { color: var(--muted); }
     .pnl-pos      { color: var(--green); }
     .pnl-neg      { color: var(--red); }
-    .conf-track   { height: 5px; background: var(--border); border-radius: 3px; }
-    .conf-fill    { height: 100%; border-radius: 3px; background: #1f6feb; transition: width .4s; }
+    .conf-track   { height: 4px; background: var(--border); border-radius: 3px; }
+    .conf-fill    { height: 100%; border-radius: 3px; background: var(--blue); transition: width .4s; }
     table         { font-size: .8rem; }
     .table > :not(caption) > * > * { background: transparent; }
-    .dot-running  { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--green); animation: pulse 1.5s infinite; }
-    .dot-stopped  { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--muted); }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+    /* Animated status dot */
+    .dot          { display:inline-block; width:9px; height:9px; border-radius:50%; flex-shrink:0; }
+    .dot-running  { background: var(--green); animation: pulse 1.5s infinite; }
+    .dot-stopped  { background: var(--muted); }
+    .dot-halted   { background: var(--red); animation: blink .8s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+    @keyframes blink  { 0%,100%{opacity:1} 50%{opacity:.15} }
+
     .sym-price    { font-size: 1.05rem; font-family: monospace; }
-    .badge-long   { background: rgba(63,185,80,.2); color: var(--green); border: 1px solid var(--green); }
-    .badge-short  { background: rgba(248,81,73,.2); color: var(--red);   border: 1px solid var(--red); }
+    .badge-long   { background: rgba(63,185,80,.15); color: var(--green); border: 1px solid var(--green)66; }
+    .badge-short  { background: rgba(248,81,73,.15);  color: var(--red);   border: 1px solid var(--red)66; }
     .badge-neutral{ background: var(--bg-surface); color: var(--muted); border: 1px solid var(--border); }
+
+    /* Start/Stop toggle group in card */
+    .btn-start-stop { font-size: .72rem; padding: 2px 0; }
+    .btn-start-stop.active-start { background: rgba(63,185,80,.18); border-color: var(--green); color: var(--green); }
+    .btn-start-stop.active-stop  { background: var(--bg-surface); border-color: var(--border); color: var(--muted); }
+
+    /* System status bar */
+    #status-bar { font-size: .8rem; border-bottom: 1px solid var(--border); }
+    .status-pill { display:inline-flex; align-items:center; gap:6px; padding:2px 10px;
+                   border-radius:20px; font-weight:600; font-size:.78rem; }
+    .status-pill.running { background:rgba(63,185,80,.12); border:1px solid var(--green)55; color:var(--green); }
+    .status-pill.stopped { background:rgba(139,148,158,.1); border:1px solid var(--border); color:var(--muted); }
+    .status-pill.halted  { background:rgba(248,81,73,.15);  border:1px solid var(--red)66;  color:var(--red); }
+    .status-pill.partial { background:rgba(210,153,34,.12); border:1px solid var(--yellow)55; color:var(--yellow); }
+
+    /* Kill-switch alert */
+    #ks-alert { display:none; }
+
+    /* V2 metric row on card */
+    .metric-row { font-size: .7rem; color: var(--muted); }
+    .metric-val { font-family: monospace; }
+    .metric-ok  { color: var(--green); }
+    .metric-bad { color: var(--red); }
+    .metric-warn{ color: var(--yellow); }
+
+    /* Navbar button group styling */
+    .ctrl-group { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; display:inline-flex; }
+    .ctrl-group .btn { border-radius: 0; border: none; border-right: 1px solid var(--border); }
+    .ctrl-group .btn:last-child { border-right: none; }
   </style>
 </head>
 <body>
 
 <!-- Navbar -->
 <nav class="navbar navbar-dark px-3 py-2">
-  <span class="navbar-brand fw-bold"><i class="bi bi-robot me-1"></i>AI Futures Bot</span>
+  <span class="navbar-brand fw-bold"><i class="bi bi-robot me-1"></i>AI Futures Bot <span class="text-muted fw-normal" style="font-size:.75rem">V2</span></span>
   <div class="d-flex align-items-center gap-3 ms-auto">
-    <span class="text-muted small" id="nav-running">0/0 running</span>
     <span class="text-muted small" id="nav-update"></span>
-    <div class="d-flex gap-2">
-      <button class="btn btn-sm btn-success px-3" onclick="startAll()"><i class="bi bi-play-fill"></i> All</button>
-      <button class="btn btn-sm btn-danger  px-3" onclick="stopAll()"><i class="bi bi-stop-fill"></i> All</button>
-      <button class="btn btn-sm btn-primary px-3" onclick="trainAll()"><i class="bi bi-cpu"></i> Train All</button>
-      <button class="btn btn-sm btn-warning px-3" onclick="closeAll()"><i class="bi bi-x-circle"></i> Close All</button>
+
+    <!-- Start / Stop — paired in one group -->
+    <div class="ctrl-group">
+      <button class="btn btn-sm btn-success px-3" id="btn-start-all" onclick="startAll()" title="Start all bots">
+        <i class="bi bi-play-fill me-1"></i>Start All
+      </button>
+      <button class="btn btn-sm btn-danger px-3" id="btn-stop-all" onclick="stopAll()" title="Stop all bots">
+        <i class="bi bi-stop-fill me-1"></i>Stop All
+      </button>
+    </div>
+
+    <!-- Secondary actions -->
+    <div class="ctrl-group">
+      <button class="btn btn-sm btn-secondary px-3" onclick="trainAll()" title="Retrain all models">
+        <i class="bi bi-cpu me-1"></i>Train
+      </button>
+      <button class="btn btn-sm btn-warning px-3" onclick="closeAll()" title="Close all open positions">
+        <i class="bi bi-x-circle me-1"></i>Close Pos
+      </button>
     </div>
   </div>
 </nav>
+
+<!-- System status bar -->
+<div id="status-bar" class="px-3 py-1 d-flex align-items-center gap-3" style="background:var(--bg-card)">
+  <span id="sys-status-pill" class="status-pill stopped"><span class="dot dot-stopped" id="sys-dot"></span><span id="sys-status-text">STOPPED</span></span>
+  <span class="text-muted small"><span id="nav-running">0/0</span> bots active</span>
+  <span class="text-muted small d-none d-md-inline" id="sys-drift">Drift: --</span>
+  <span class="text-muted small d-none d-md-inline" id="sys-sharpe">Sharpe: --</span>
+  <div id="ks-alert" class="ms-auto d-flex align-items-center gap-2 text-danger fw-bold small">
+    <i class="bi bi-exclamation-triangle-fill"></i><span id="ks-reason"></span>
+  </div>
+</div>
 
 <div class="container-fluid p-3">
 
@@ -116,9 +178,9 @@
       <div style="max-height:280px;overflow-y:auto">
         <table class="table table-hover table-dark mb-0">
           <thead class="table-secondary sticky-top">
-            <tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>SL</th><th>TP</th><th>ML%</th><th>Status</th></tr>
+            <tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>SL</th><th>TP</th><th>ML%</th><th>P&amp;L</th><th>Status</th></tr>
           </thead>
-          <tbody id="tbl-trades"><tr><td colspan="9" class="text-center text-muted py-3">No trades yet</td></tr></tbody>
+          <tbody id="tbl-trades"><tr><td colspan="10" class="text-center text-muted py-3">No trades yet</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -181,43 +243,112 @@ function renderCards(symbols) {
       col.innerHTML = `
         <div class="card sym-card h-100" id="card-${sym}" onclick="selectSym('${sym}')">
           <div class="card-body p-2">
+            <!-- Header: symbol name + status dot + status label -->
             <div class="d-flex justify-content-between align-items-center mb-1">
               <span class="fw-bold">${sym.replace('USDT','')}<span class="text-muted fw-normal">/USDT</span></span>
-              <span class="dot-stopped" id="dot-${sym}"></span>
+              <span class="d-flex align-items-center gap-1">
+                <span class="dot dot-stopped" id="dot-${sym}"></span>
+                <span class="text-muted" id="status-lbl-${sym}" style="font-size:.68rem">STOPPED</span>
+              </span>
             </div>
             <div class="sym-price mb-1" id="price-${sym}">--</div>
             <div class="mb-1" id="sig-${sym}">${sigBadge(0)}</div>
             <div class="conf-track mb-1"><div class="conf-fill" id="conf-${sym}" style="width:0%"></div></div>
-            <div class="d-flex justify-content-between text-muted" style="font-size:.75rem">
-              <span>ML confidence</span><span id="confpct-${sym}">0%</span>
+            <div class="d-flex justify-content-between text-muted mb-1" style="font-size:.72rem">
+              <span>ML conf</span><span id="confpct-${sym}">0%</span>
+            </div>
+            <!-- V2 metrics row -->
+            <div class="metric-row d-flex justify-content-between mb-1">
+              <span>Sharpe <span class="metric-val" id="sharpe-${sym}">--</span></span>
+              <span>Drift <span class="metric-val" id="drift-${sym}">--</span></span>
             </div>
             <div class="mt-1 small" id="pos-${sym}"></div>
+
+            <!-- Start / Stop — single toggle row + train button -->
             <div class="mt-2 d-flex gap-1">
-              <button class="btn btn-outline-success flex-fill py-0" style="font-size:.7rem"
-                onclick="event.stopPropagation();startSym('${sym}')">▶</button>
-              <button class="btn btn-outline-danger flex-fill py-0" style="font-size:.7rem"
-                onclick="event.stopPropagation();stopSym('${sym}')">■</button>
-              <button class="btn btn-outline-secondary flex-fill py-0" style="font-size:.7rem"
-                onclick="event.stopPropagation();trainSym('${sym}')">⟳</button>
+              <button class="btn btn-outline-success btn-start-stop flex-fill active-stop"
+                id="btn-start-${sym}"
+                onclick="event.stopPropagation();startSym('${sym}')"
+                title="Start bot">
+                <i class="bi bi-play-fill"></i> Start
+              </button>
+              <button class="btn btn-outline-danger btn-start-stop flex-fill"
+                id="btn-stop-${sym}"
+                onclick="event.stopPropagation();stopSym('${sym}')"
+                title="Stop bot">
+                <i class="bi bi-stop-fill"></i> Stop
+              </button>
+              <button class="btn btn-outline-secondary btn-start-stop px-2"
+                onclick="event.stopPropagation();trainSym('${sym}')"
+                title="Retrain model">
+                <i class="bi bi-arrow-clockwise"></i>
+              </button>
             </div>
           </div>
         </div>`;
       wrap.appendChild(col);
       if (!activeSymbol) loadChart(sym);
     }
-    // Update values
-    document.getElementById('dot-'     + sym).className = d.status === 'running' ? 'dot-running' : 'dot-stopped';
+
+    const isRunning = d.status === 'running';
+    const isHalted  = d.trading_halted;
+
+    // Dot + status label
+    const dot = document.getElementById('dot-' + sym);
+    const lbl = document.getElementById('status-lbl-' + sym);
+    if (isHalted) {
+      dot.className = 'dot dot-halted';
+      lbl.textContent = 'HALTED';
+      lbl.style.color = 'var(--red)';
+    } else if (isRunning) {
+      dot.className = 'dot dot-running';
+      lbl.textContent = 'RUNNING';
+      lbl.style.color = 'var(--green)';
+    } else {
+      dot.className = 'dot dot-stopped';
+      lbl.textContent = 'STOPPED';
+      lbl.style.color = 'var(--muted)';
+    }
+
+    // Start / Stop button active states
+    const btnStart = document.getElementById('btn-start-' + sym);
+    const btnStop  = document.getElementById('btn-stop-'  + sym);
+    if (isRunning) {
+      btnStart.classList.add('active-start'); btnStart.classList.remove('active-stop');
+      btnStart.disabled = true;
+      btnStop.disabled  = false;
+    } else {
+      btnStart.classList.remove('active-start'); btnStart.classList.add('active-stop');
+      btnStart.disabled = false;
+      btnStop.disabled  = true;
+    }
+
     document.getElementById('price-'   + sym).textContent = usd(d.current_price, (d.current_price||0) > 10 ? 2 : 5);
     document.getElementById('sig-'     + sym).innerHTML = sigBadge(d.signal);
     document.getElementById('conf-'    + sym).style.width = Math.min((d.ml_confidence||0)*100, 100) + '%';
     document.getElementById('confpct-' + sym).textContent = ((d.ml_confidence||0)*100).toFixed(1) + '%';
+
+    // V2: rolling sharpe + drift
+    const sharpeEl = document.getElementById('sharpe-' + sym);
+    const rs = d.rolling_sharpe;
+    if (rs != null) {
+      sharpeEl.textContent = rs.toFixed(2);
+      sharpeEl.className = 'metric-val ' + (rs >= 1.2 ? 'metric-ok' : rs >= 0.5 ? 'metric-warn' : 'metric-bad');
+    } else { sharpeEl.textContent = '--'; sharpeEl.className = 'metric-val'; }
+
+    const driftEl = document.getElementById('drift-' + sym);
+    const ds = d.drift_score;
+    if (ds != null) {
+      driftEl.textContent = ds.toFixed(3);
+      driftEl.className = 'metric-val ' + (ds < 0.05 ? 'metric-ok' : ds < 0.10 ? 'metric-warn' : 'metric-bad');
+    } else { driftEl.textContent = '--'; driftEl.className = 'metric-val'; }
 
     const posEl  = document.getElementById('pos-' + sym);
     const posArr = d.positions || [];
     if (posArr.length) {
       const p   = posArr[0];
       const amt = parseFloat(p.positionAmt);
-      const pnl = parseFloat(p.unrealizedProfit||0);
+      const pnl = parseFloat(p.unRealizedProfit||0);
       posEl.innerHTML = `<span class="${pnl>=0?'pnl-pos':'pnl-neg'}">${amt>0?'▲':'▼'} ${Math.abs(amt)} · ${usd(pnl)}</span>`;
     } else {
       posEl.textContent = '';
@@ -239,7 +370,7 @@ function renderPositions(symbols) {
   for (const [sym, d] of Object.entries(symbols)) {
     for (const p of (d.positions || [])) {
       const amt  = parseFloat(p.positionAmt);
-      const pnl  = parseFloat(p.unrealizedProfit||0);
+      const pnl  = parseFloat(p.unRealizedProfit||0);
       const side = amt > 0 ? 'LONG' : 'SHORT';
       rows.push(`<tr>
         <td>${sym}</td>
@@ -260,10 +391,16 @@ function renderPositions(symbols) {
 function renderTrades(trades) {
   const tb = document.getElementById('tbl-trades');
   if (!trades.length) {
-    tb.innerHTML = '<tr><td colspan="9" class="text-center text-muted py-3">No trades yet</td></tr>';
+    tb.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-3">No trades yet</td></tr>';
     return;
   }
-  tb.innerHTML = trades.map(t => `<tr>
+  tb.innerHTML = trades.map(t => {
+    const pnl = t.pnl || 0;
+    const pnlCls = pnl > 0 ? 'text-success fw-bold' : pnl < 0 ? 'text-danger fw-bold' : 'text-muted';
+    const pnlTxt = t.status === 'OPEN'
+      ? `<span class="text-warning fst-italic">${pnl >= 0 ? '+' : ''}${usd(pnl)}</span>`
+      : `<span class="${pnlCls}">${pnl >= 0 ? '+' : ''}${usd(pnl)}</span>`;
+    return `<tr>
     <td>${new Date(t.time).toLocaleTimeString()}</td>
     <td>${t.symbol}</td>
     <td class="${t.side==='LONG'?'sig-long':'sig-short'} fw-bold">${t.side}</td>
@@ -272,8 +409,10 @@ function renderTrades(trades) {
     <td>${usd(t.stop_loss)}</td>
     <td>${usd(t.take_profit)}</td>
     <td>${((t.ml_confidence||0)*100).toFixed(1)}%</td>
+    <td>${pnlTxt}</td>
     <td><span class="badge ${t.status==='OPEN'?'bg-success':'bg-secondary'}">${t.status}</span></td>
-  </tr>`).join('');
+  </tr>`;
+  }).join('');
 }
 
 // ── Status polling ─────────────────────────────────────────────────────────
@@ -284,7 +423,7 @@ async function updateStatus() {
     document.getElementById('s-balance').textContent = usd(d.balance);
     document.getElementById('s-total').textContent   = usd(d.total_balance);
     document.getElementById('s-bots').textContent    = `${d.running_count}/${d.bot_count}`;
-    document.getElementById('nav-running').textContent = `${d.running_count}/${d.bot_count} running`;
+    document.getElementById('nav-running').textContent = `${d.running_count}/${d.bot_count}`;
 
     const ts = 'Updated ' + new Date().toLocaleTimeString();
     document.getElementById('nav-update').textContent  = ts;
@@ -294,6 +433,66 @@ async function updateStatus() {
     const pnl   = d.daily_pnl ?? 0;
     pnlEl.textContent = (pnl>=0?'+':'')+usd(Math.abs(pnl));
     pnlEl.className   = 'fw-bold fs-5 font-monospace ' + (pnl>=0?'pnl-pos':'pnl-neg');
+
+    // ── System status bar ─────────────────────────────────────────────────
+    const runCount  = d.running_count ?? 0;
+    const botCount  = d.bot_count ?? 0;
+    const anyHalted = d.any_halted ?? false;
+    const pill      = document.getElementById('sys-status-pill');
+    const dot       = document.getElementById('sys-dot');
+    const lbl       = document.getElementById('sys-status-text');
+    const startBtn  = document.getElementById('btn-start-all');
+    const stopBtn   = document.getElementById('btn-stop-all');
+
+    if (anyHalted) {
+      pill.className = 'status-pill halted';
+      dot.className  = 'dot dot-halted';
+      lbl.textContent = 'KILL-SWITCH ACTIVE';
+    } else if (runCount === botCount && botCount > 0) {
+      pill.className = 'status-pill running';
+      dot.className  = 'dot dot-running';
+      lbl.textContent = 'ALL RUNNING';
+    } else if (runCount > 0) {
+      pill.className = 'status-pill partial';
+      dot.className  = 'dot dot-running';
+      lbl.textContent = `PARTIAL (${runCount}/${botCount})`;
+    } else {
+      pill.className = 'status-pill stopped';
+      dot.className  = 'dot dot-stopped';
+      lbl.textContent = 'ALL STOPPED';
+    }
+
+    // Disable/enable global start-stop buttons based on state
+    startBtn.disabled = (runCount === botCount && botCount > 0);
+    stopBtn.disabled  = (runCount === 0);
+
+    // Aggregate V2 metrics across all bots
+    const syms = d.symbols ? Object.values(d.symbols) : [];
+    const sharpes = syms.map(s => s.rolling_sharpe).filter(v => v != null);
+    const drifts  = syms.map(s => s.drift_score).filter(v => v != null);
+    if (sharpes.length) {
+      const avgS = sharpes.reduce((a,b)=>a+b,0)/sharpes.length;
+      const el = document.getElementById('sys-sharpe');
+      el.textContent = `Sharpe: ${avgS.toFixed(2)}`;
+      el.className   = 'text-muted small d-none d-md-inline ' +
+        (avgS >= 1.2 ? 'text-success' : avgS >= 0.5 ? 'text-warning' : 'text-danger');
+    }
+    if (drifts.length) {
+      const maxD = Math.max(...drifts);
+      const el = document.getElementById('sys-drift');
+      el.textContent = `Drift: ${maxD.toFixed(3)}`;
+      el.className   = 'text-muted small d-none d-md-inline ' +
+        (maxD < 0.05 ? 'text-success' : maxD < 0.10 ? 'text-warning' : 'text-danger');
+    }
+
+    // Kill-switch alert banner
+    const ksAlert = document.getElementById('ks-alert');
+    if (d.halt_reason) {
+      ksAlert.style.display = 'flex';
+      document.getElementById('ks-reason').textContent = d.halt_reason;
+    } else {
+      ksAlert.style.display = 'none';
+    }
 
     if (d.symbols) { renderCards(d.symbols); renderPositions(d.symbols); }
   } catch(e) { console.warn('status:', e); }

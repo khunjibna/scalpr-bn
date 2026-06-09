@@ -13,11 +13,20 @@ trading:
   testnet: true
 
 risk:
-  max_position_pct: 0.02    # 2% = $200/เทรด
-  stop_loss_pct: 0.004      # SL แคบ 0.4% (scalping ต้องตัดขาดทุนไว)
-  take_profit_ratio: 1.5    # TP 1.5:1 — เป้าเล็กแต่ทำบ่อย
-  max_daily_loss_pct: 0.06  # หยุดถ้าขาดทุนเกิน 6%/วัน
+  max_position_pct: 0.02      # 2% = $200/เทรด
+  stop_loss_pct: 0.004        # SL แคบ 0.4% (scalping ต้องตัดขาดทุนไว)
+  take_profit_ratio: 1.5      # TP 1.5:1 — เป้าเล็กแต่ทำบ่อย
+  max_daily_loss_pct: 0.06    # หยุดถ้าขาดทุนเกิน 6%/วัน
   max_open_positions: 1
+
+  # ── V2 Portfolio-level guards (handbook §8) ────────────────────────────────
+  max_portfolio_dd: 0.25      # หยุดถ้า portfolio drawdown เกิน 25%
+  max_leverage: 3.0           # Leverage cap สำหรับ position limit check
+  max_position_per_symbol: 0.05   # Max 5% of equity per symbol (notional)
+  rolling_window: 50          # จำนวน trades สำหรับ rolling Sharpe / win-rate
+  drift_kill_threshold: 3.0   # KL > 3.0 → kill-switch (ต้องเห็น ≥30 cycles ก่อน)
+                              # ค่า KL สูตรนี้: volatility 2x ≈ 0.8 ต่อ feature
+                              # KL 3.0 ≈ drift รุนแรงมาก (~5x vol หรือ mean shift ใหญ่)
 
 strategy:
   # ── ใช้ EMA เร็วกว่าปกติสำหรับ scalping ──────────────────────────────────
@@ -43,6 +52,13 @@ ml:
   lookahead_candles: 3      # predict 3 candle ข้างหน้า (3 นาที)
   confidence_threshold: 0.60
   n_estimators: 200
+  rolling_window: 50        # จำนวน trades สำหรับ rolling Sharpe / win-rate trigger
+
+  # ── V2 retraining thresholds (handbook §12.3) ────────────────────────────
+  drift_threshold: 1.0      # KL divergence > 1.0 → retrain (~2x volatility change)
+  drift_min_obs: 30         # ต้องเห็น ≥30 cycles ก่อนที่ drift score จะ feed kill-switch
+  min_rolling_sharpe: 0.5   # Rolling Sharpe < 0.5 → retrain
+  min_rolling_win_rate: 0.40  # Rolling win-rate < 40% → retrain
 
 dashboard:
   host: 0.0.0.0
@@ -51,3 +67,4 @@ dashboard:
 bot:
   loop_interval_seconds: 10  # ตรวจสัญญาณทุก 10 วินาที
   klines_limit: 300
+  signal_expiry_seconds: 300  # V2: สัญญาณหมดอายุหลัง 5 นาที
