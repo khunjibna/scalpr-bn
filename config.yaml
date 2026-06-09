@@ -16,21 +16,37 @@ trading:
     - TRXUSDT    # 11 TRON           — market cap top 10, high tx volume
     - NEARUSDT   # 12 NEAR Protocol  — market cap top 20, consistent volume
   timeframe: 1m             # 1m สำหรับ scalping (3m ก็ได้ถ้า noise เยอะเกิน)
-  leverage: 10
+  leverage: 5               # $5,000: 5x — liquidation ห่าง ~20% (เดิม 10x สำหรับ $300)
   margin_type: ISOLATED
   testnet: true
-  simulated_balance: null  # จำลองพอร์ต $300 USD (ใช้แทน testnet balance จริง)
-                            # ตั้งเป็น null เพื่อใช้ balance จริงจาก Binance
+  simulated_balance: null  # null = ดึง balance จริงจาก Binance
+                            # ตั้งเป็น 300.0 หรือ 5000.0 เพื่อ override
 risk:
-  max_position_pct: 0.02      # 2% = $200/เทรด
-  stop_loss_pct: 0.004        # SL แคบ 0.4% (scalping ต้องตัดขาดทุนไว)
-  take_profit_ratio: 1.5      # TP 1.5:1 — เป้าเล็กแต่ทำบ่อย
-  max_daily_loss_pct: 0.06    # หยุดถ้าขาดทุนเกิน 6%/วัน
+  # ── $5,000 portfolio settings ────────────────────────────────────────────
+  max_position_pct: 0.01      # 1% × $5,000 = $50/เทรด  (เดิม 0.02 = $6 สำหรับ $300)
+  stop_loss_pct: 0.005        # SL 0.5% — กว้างกว่า noise 1m  (เดิม 0.004)
+  take_profit_ratio: 2.0      # R:R 2:1 → TP = 1.0%  (เดิม 1.5)
+  max_daily_loss_pct: 0.03    # หยุดถ้าขาดทุนเกิน 3% = $150/วัน  (เดิม 0.06 สำหรับ $300)
   max_open_positions: 1
 
+  # ── $300 portfolio settings (สำรองไว้) ──────────────────────────────────
+  # max_position_pct: 0.02    # 2% × $300 = $6/เทรด
+  # stop_loss_pct: 0.004      # SL 0.4%
+  # take_profit_ratio: 1.5    # R:R 1.5:1
+  # max_daily_loss_pct: 0.06  # 6% = $18/วัน
+  # leverage: 10              # 10x
+
+  # ── $1,000 portfolio settings (สำรองไว้ — แนะนำสำหรับเริ่มจริง) ─────────
+  # max_position_pct: 0.01    # 1% × $1,000 = $10/เทรด
+  # stop_loss_pct: 0.005      # SL 0.5%
+  # take_profit_ratio: 2.0    # R:R 2:1 → TP = 1.0%
+  # max_daily_loss_pct: 0.03  # 3% = $30/วัน
+  # max_portfolio_dd: 0.15    # 15% = $150
+  # leverage: 5               # 5x — ปลอดภัย liquidation ห่าง ~20%
+
   # ── V2 Portfolio-level guards (handbook §8) ────────────────────────────────
-  max_portfolio_dd: 0.25      # หยุดถ้า portfolio drawdown เกิน 25%
-  max_leverage: 3.0           # Leverage cap สำหรับ position limit check
+  max_portfolio_dd: 0.15      # หยุดถ้า portfolio drawdown เกิน 15% = $750  (เดิม 0.25)
+  max_leverage: 5.0           # Leverage cap  (เดิม 3.0)
   max_position_per_symbol: 0.05   # Max 5% of equity per symbol (notional)
   rolling_window: 50          # จำนวน trades สำหรับ rolling Sharpe / win-rate
   drift_kill_threshold: 3.0   # KL > 3.0 → kill-switch (ต้องเห็น ≥30 cycles ก่อน)

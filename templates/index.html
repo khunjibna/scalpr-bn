@@ -431,7 +431,7 @@ async function updateStatus() {
 
     const pnlEl = document.getElementById('s-pnl');
     const pnl   = d.daily_pnl ?? 0;
-    pnlEl.textContent = (pnl>=0?'+':'')+usd(Math.abs(pnl));
+    pnlEl.textContent = (pnl>=0?'+':'-')+usd(Math.abs(pnl));
     pnlEl.className   = 'fw-bold fs-5 font-monospace ' + (pnl>=0?'pnl-pos':'pnl-neg');
 
     // ── System status bar ─────────────────────────────────────────────────
