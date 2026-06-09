@@ -70,17 +70,18 @@ class BotManager:
         total_balance = self._client.get_total_balance()
 
         per_symbol: dict[str, dict] = {}
-        total_daily_pnl  = 0.0
-        total_daily_loss = 0.0
         running_count    = 0
         any_halted       = False
         halt_reasons     = []
 
+        # Daily P&L from DB (survives restarts, includes all closed trades today)
+        sym_pnls         = {sym: self._db.get_daily_pnl(sym) for sym in self.bots}
+        total_daily_pnl  = sum(sym_pnls.values())
+        total_daily_loss = sum(abs(v) for v in sym_pnls.values() if v < 0)
+
         for symbol, bot in self.bots.items():
             s = bot.get_status()
             per_symbol[symbol]    = s
-            total_daily_pnl      += s.get("daily_pnl",  0.0)
-            total_daily_loss     += s.get("daily_loss", 0.0)
             if s.get("status") == "running":
                 running_count += 1
             if s.get("trading_halted"):

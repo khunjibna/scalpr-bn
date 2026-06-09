@@ -18,6 +18,7 @@ trades:
     pnl           REAL
 """
 import sqlite3
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -48,31 +49,31 @@ CREATE INDEX IF NOT EXISTS idx_trades_time   ON trades(time DESC);
 
 
 class TradeDB:
-    """Thread-safe SQLite wrapper (WAL mode, one connection per call)."""
+    """Thread-safe SQLite wrapper — single persistent connection + Lock."""
 
     def __init__(self, db_path: str = _DEFAULT_PATH):
         self._path = db_path
+        self._lock = threading.Lock()
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as con:
-            con.executescript(_DDL)
+        self._con = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+        self._con.row_factory = sqlite3.Row
+        self._con.execute("PRAGMA journal_mode=WAL")
+        self._con.execute("PRAGMA foreign_keys=ON")
+        self._con.executescript(_DDL)
         logger.info(f"TradeDB ready: {db_path}")
 
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self._path, check_same_thread=False, timeout=10)
-        con.row_factory = sqlite3.Row
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("PRAGMA foreign_keys=ON")
-        return con
+    def close(self):
+        """Explicit shutdown — call on process exit if desired."""
+        with self._lock:
+            self._con.close()
 
     # ── Write ─────────────────────────────────────────────────────────────────
 
     def save_trade(self, trade: dict) -> str:
-        """Insert a new OPEN trade.  Returns the uid (generates one if missing)."""
+        """Insert a new OPEN trade. Returns the uid (generates one if missing)."""
         uid = trade.get("uid") or str(uuid.uuid4())
-        with self._connect() as con:
-            con.execute(
+        with self._lock:
+            self._con.execute(
                 """
                 INSERT OR IGNORE INTO trades
                     (uid, order_id, time, symbol, side, quantity,
@@ -94,43 +95,63 @@ class TradeDB:
                     float(trade.get("pnl", 0.0)),
                 ),
             )
+            self._con.commit()
         return uid
 
     def close_trade(self, uid: str, status: str, pnl: float) -> None:
         """Update status + pnl + close_time when a position is closed."""
-        with self._connect() as con:
-            con.execute(
+        with self._lock:
+            self._con.execute(
                 "UPDATE trades SET status=?, pnl=?, close_time=? WHERE uid=?",
                 (status, float(pnl), datetime.now().isoformat(), uid),
             )
+            self._con.commit()
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
     def get_trades(self, limit: int = 100, symbol: str | None = None) -> list[dict]:
         """Return recent trades as list[dict], newest first."""
-        with self._connect() as con:
+        with self._lock:
             if symbol:
-                rows = con.execute(
+                rows = self._con.execute(
                     "SELECT * FROM trades WHERE symbol=? ORDER BY time DESC LIMIT ?",
                     (symbol, limit),
                 ).fetchall()
             else:
-                rows = con.execute(
+                rows = self._con.execute(
                     "SELECT * FROM trades ORDER BY time DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_daily_pnl(self, symbol: str | None = None) -> float:
+        """Sum of realized PnL for closed trades opened today (UTC date)."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        with self._lock:
+            if symbol:
+                row = self._con.execute(
+                    "SELECT COALESCE(SUM(pnl),0) FROM trades "
+                    "WHERE status != 'OPEN' AND symbol=? AND time LIKE ?",
+                    (symbol, f"{today}%"),
+                ).fetchone()
+            else:
+                row = self._con.execute(
+                    "SELECT COALESCE(SUM(pnl),0) FROM trades "
+                    "WHERE status != 'OPEN' AND time LIKE ?",
+                    (f"{today}%",),
+                ).fetchone()
+        return float(row[0]) if row else 0.0
+
     def get_open_trades(self, symbol: str | None = None) -> list[dict]:
         """Return all currently OPEN trades (for position recovery on restart)."""
-        with self._connect() as con:
+        with self._lock:
             if symbol:
-                rows = con.execute(
+                rows = self._con.execute(
                     "SELECT * FROM trades WHERE status='OPEN' AND symbol=? ORDER BY time DESC",
                     (symbol,),
                 ).fetchall()
             else:
-                rows = con.execute(
+                rows = self._con.execute(
                     "SELECT * FROM trades WHERE status='OPEN' ORDER BY time DESC"
                 ).fetchall()
         return [dict(r) for r in rows]

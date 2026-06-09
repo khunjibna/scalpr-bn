@@ -211,10 +211,17 @@ class TradingBot:
         price     = float(df["close"].iloc[-1])
 
         if not positions:
-            # Position closed (by exchange SL/TP or manually) — clear tracker
+            # Position closed (by exchange SL/TP or manually)
             if self.symbol in self._sltp:
                 del self._sltp[self.symbol]
                 self._position_open_time = None
+                # Try to get realized PnL from the last closed trade in DB
+                if self.db:
+                    closed = self.db.get_trades(limit=1, symbol=self.symbol)
+                    if closed and closed[0].get("status") != "OPEN":
+                        realized_pnl = float(closed[0].get("pnl", 0.0))
+                        self.risk.record_trade(realized_pnl)
+                        self.strategy.record_trade_result(realized_pnl)
             return
 
         for pos in positions:
