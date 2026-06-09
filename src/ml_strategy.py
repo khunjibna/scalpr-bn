@@ -5,6 +5,7 @@ feature drift detection, and automated retraining triggers.
 import os
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*sklearn.utils.parallel.*")
 warnings.filterwarnings("ignore", category=FutureWarning)
 from collections import deque
 from datetime import datetime
@@ -296,7 +297,7 @@ class MLStrategy:
             n_estimators=self.ml_cfg.get("n_estimators", 200),
             max_depth=10,
             min_samples_leaf=10,
-            n_jobs=-1,
+            n_jobs=1,   # single-thread: avoids sklearn parallel config warning
             random_state=seed,
         )
         model.fit(Xtr_s, y_train)
@@ -448,7 +449,23 @@ class MLStrategy:
         # ── V2 validation gates ───────────────────────────────────────────────
         passed, failures = self._check_validation_gates(best)
         if not passed:
-            logger.warning(f"V2 gates FAILED: {failures} — deploying anyway")
+            if not self.is_trained:
+                # No existing model — deploy anyway so the bot can start trading,
+                # but flag as low-quality; next retrain cycle will try to improve.
+                logger.warning(
+                    f"V2 gates FAILED (first train): {failures} — deploying cautiously"
+                )
+            else:
+                # Already have a working model — keep the old one, skip this retrain
+                logger.warning(
+                    f"V2 gates FAILED: {failures} — keeping previous model, will retry"
+                )
+                self._last_validation_metrics.update({
+                    "gates_passed":   False,
+                    "gate_failures":  failures,
+                    "wf_sharpe_variance": wf_var,
+                })
+                return False
         else:
             logger.success(
                 f"V2 gates PASSED | sharpe={best['val_sharpe']:.3f} | "
@@ -558,6 +575,13 @@ class MLStrategy:
         """
         if not self.is_trained or self.last_trained is None:
             return True
+
+        # Gates failed last time → retry sooner (1h instead of retrain_hours)
+        if not self._last_validation_metrics.get("gates_passed", True):
+            hours_since = (datetime.now() - self.last_trained).total_seconds() / 3600
+            if hours_since >= 1.0:
+                logger.info("Retrain: previous gates failed, retrying with fresh data")
+                return True
 
         hours_since = (datetime.now() - self.last_trained).total_seconds() / 3600
         if hours_since >= self.ml_cfg.get("retrain_hours", 24):

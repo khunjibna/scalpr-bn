@@ -26,7 +26,8 @@ class BotManager:
         )
 
         # One shared Binance client for all bots
-        self._client = BinanceClient(testnet=use_testnet)
+        sim_balance = trading_cfg.get("simulated_balance") or None
+        self._client = BinanceClient(testnet=use_testnet, simulated_balance=sim_balance)
 
         # Shared SQLite DB (all bots write to the same file)
         db_path = config.get("database", {}).get("path", "data/trades.db")
@@ -47,10 +48,34 @@ class BotManager:
         for symbol, bot in self.bots.items():
             t = threading.Thread(target=bot.start, daemon=True, name=f"Bot-{symbol}")
             t.start()
+        # Background thread: keep free_margin updated across all bots
+        threading.Thread(target=self._margin_updater, daemon=True,
+                         name="MarginUpdater").start()
 
     def stop_all(self):
         for bot in self.bots.values():
             bot.stop()
+
+    def _margin_updater(self):
+        """Background thread: compute portfolio free margin and push to all bots."""
+        import time
+        while True:
+            try:
+                balance = self._client.get_futures_balance()
+                # Sum margin in use across all open positions
+                used = 0.0
+                for bot in self.bots.values():
+                    for pos in self._client.get_positions(bot.symbol):
+                        notional = abs(float(pos.get("notional", 0)))
+                        leverage = float(pos.get("leverage", 1)) or 1
+                        used += notional / leverage
+                free = max(0.0, balance - used)
+                for bot in self.bots.values():
+                    bot.free_margin = free
+                logger.debug(f"Portfolio margin | balance={balance:.2f} used={used:.2f} free={free:.2f}")
+            except Exception as e:
+                logger.warning(f"MarginUpdater error: {e}")
+            time.sleep(5)  # update every 5 s
 
     def start_symbol(self, symbol: str):
         bot = self.bots.get(symbol)

@@ -2,16 +2,25 @@ trading:
   # ── Scalping mode ──────────────────────────────────────────────────────────
   # รอบสั้น 1m candle, ถือ position แค่ 2-10 นาที
   symbols:
-    - BTCUSDT
-    - ETHUSDT
-    - SOLUSDT
-    - BNBUSDT
-    - DOGEUSDT
+    # ── Top 12 by Market Cap + Volume (Binance USDT Futures) ─────────────
+    - BTCUSDT    # 1  Bitcoin        — vol $13.4B/day
+    - ETHUSDT    # 2  Ethereum       — vol $10.1B/day
+    - BNBUSDT    # 3  BNB            — market cap top 3
+    - SOLUSDT    # 4  Solana         — vol $1.9B/day
+    - XRPUSDT    # 5  XRP            — vol $0.7B/day
+    - DOGEUSDT   # 6  Dogecoin       — high retail volume
+    - ADAUSDT    # 7  Cardano        — market cap top 10
+    - AVAXUSDT   # 8  Avalanche      — market cap top 10
+    - LINKUSDT   # 9  Chainlink      — DeFi oracle leader
+    - DOTUSDT    # 10 Polkadot       — market cap top 15
+    - TRXUSDT    # 11 TRON           — market cap top 10, high tx volume
+    - NEARUSDT   # 12 NEAR Protocol  — market cap top 20, consistent volume
   timeframe: 1m             # 1m สำหรับ scalping (3m ก็ได้ถ้า noise เยอะเกิน)
   leverage: 10
   margin_type: ISOLATED
   testnet: true
-
+  simulated_balance: null  # จำลองพอร์ต $300 USD (ใช้แทน testnet balance จริง)
+                            # ตั้งเป็น null เพื่อใช้ balance จริงจาก Binance
 risk:
   max_position_pct: 0.02      # 2% = $200/เทรด
   stop_loss_pct: 0.004        # SL แคบ 0.4% (scalping ต้องตัดขาดทุนไว)

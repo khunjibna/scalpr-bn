@@ -13,13 +13,14 @@ _TESTNET_STREAM_URL = "wss://stream.binancefuture.com"
 
 
 class BinanceClient:
-    def __init__(self, testnet: bool = False):
+    def __init__(self, testnet: bool = False, simulated_balance: float | None = None):
         api_key = os.getenv("BINANCE_API_KEY")
         api_secret = os.getenv("BINANCE_API_SECRET")
         if not api_key or not api_secret:
             raise ValueError("BINANCE_API_KEY and BINANCE_API_SECRET must be set in .env")
 
         self.testnet = testnet
+        self._simulated_balance: float | None = simulated_balance
         if testnet:
             self.client = Client(
                 api_key, api_secret,
@@ -27,7 +28,10 @@ class BinanceClient:
             )
             # Override futures base URL to Binance Futures Testnet
             self.client.FUTURES_URL = _TESTNET_BASE_URL + "/fapi"
-            logger.warning("⚠️  TESTNET MODE — ไม่ใช้เงินจริง")
+            if simulated_balance:
+                logger.warning(f"⚠️  TESTNET MODE — จำลองพอร์ต ${simulated_balance:,.0f} USD")
+            else:
+                logger.warning("⚠️  TESTNET MODE — ไม่ใช้เงินจริง")
         else:
             self.client = Client(api_key, api_secret)
             logger.info("🔴 LIVE MODE — ใช้เงินจริง")
@@ -44,7 +48,10 @@ class BinanceClient:
     # ── Balance ──────────────────────────────────────────────────────────────
 
     def get_futures_balance(self) -> float:
-        """USDT available balance in futures wallet"""
+        """USDT available balance — returns simulated_balance if set in config."""
+        sim = self._simulated_balance
+        if sim is not None and sim > 0:
+            return sim
         try:
             for b in self.client.futures_account_balance():
                 if b["asset"] == "USDT":
@@ -55,7 +62,10 @@ class BinanceClient:
             return 0.0
 
     def get_total_balance(self) -> float:
-        """Total USDT wallet balance (includes unrealized PnL)"""
+        """Total USDT wallet balance — returns simulated_balance if set."""
+        sim = self._simulated_balance
+        if sim is not None and sim > 0:
+            return sim
         try:
             account = self.client.futures_account()
             return float(account["totalWalletBalance"])

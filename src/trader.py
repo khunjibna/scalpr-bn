@@ -66,6 +66,9 @@ class TradingBot:
         self._last_signal_time: datetime | None = None
         self._signal_expiry_seconds: int = self.bot_cfg.get("signal_expiry_seconds", 300)
 
+        # Global margin guard — updated by BotManager each cycle
+        self.free_margin: float | None = None
+
         self._setup_symbol()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -91,7 +94,7 @@ class TradingBot:
 
         while self._running:
             try:
-                self.run_cycle()
+                self.run_cycle(free_margin=self.free_margin)
             except Exception as e:
                 with self._lock:
                     self.error_message = str(e)
@@ -108,7 +111,7 @@ class TradingBot:
 
     # ── Main cycle ────────────────────────────────────────────────────────────
 
-    def run_cycle(self):
+    def run_cycle(self, free_margin: float | None = None):
         with self._lock:
             self.last_update = datetime.now()
 
@@ -198,7 +201,7 @@ class TradingBot:
             self._manage_positions(df)
 
             if self.current_signal != 0:
-                self._process_signal(self.current_signal, df)
+                self._process_signal(self.current_signal, df, free_margin=free_margin)
 
             self.error_message = ""
 
@@ -289,7 +292,7 @@ class TradingBot:
 
     # ── Signal execution ──────────────────────────────────────────────────────
 
-    def _process_signal(self, signal: int, df):
+    def _process_signal(self, signal: int, df, free_margin: float | None = None):
         """Evaluate signal and open a new position if all conditions pass."""
         positions = self.client.get_positions(self.symbol)
 
@@ -333,7 +336,16 @@ class TradingBot:
         max_margin      = balance * 0.20
         if margin_required > max_margin:
             qty = (max_margin * self.leverage) / price
+            margin_required = max_margin
             logger.info(f"Qty capped by margin: margin_cap={max_margin:.2f} USDT → qty={qty:.6f}")
+
+        # Global free-margin guard — block if portfolio has insufficient margin
+        if free_margin is not None and margin_required > free_margin:
+            logger.warning(
+                f"{self.symbol}: skip — margin needed={margin_required:.2f} "
+                f"> portfolio free={free_margin:.2f} USDT"
+            )
+            return
 
         qty = self.client.round_quantity(qty, self.step_size)
 
