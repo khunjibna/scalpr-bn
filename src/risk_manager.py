@@ -43,15 +43,33 @@ class RiskManager:
     # ── Position sizing ───────────────────────────────────────────────────────
 
     def calculate_position_size(
-        self, balance: float, entry_price: float, stop_price: float
+        self, balance: float, entry_price: float, stop_price: float,
+        win_rate: float | None = None, payoff_ratio: float | None = None,
     ) -> float:
         """
-        Fixed-fractional sizing with Kelly-inspired confidence scalar.
-        Risk max_position_pct of balance; divide by per-unit price risk.
-        Returns quantity in base asset.
+        Kelly-adjusted position sizing (handbook §7.1).
+        f* = (p×b − (1−p)) / b  where p=win_rate, b=payoff_ratio
+        Uses half-Kelly capped at max_position_pct.
+        Falls back to fixed-fractional when stats are unavailable.
         """
-        max_pct     = self.risk_cfg.get("max_position_pct", 0.02)
-        risk_amount = balance * max_pct
+        max_pct = self.risk_cfg.get("max_position_pct", 0.02)
+
+        if win_rate is not None and payoff_ratio is not None and payoff_ratio > 0 and 0 < win_rate < 1:
+            kelly_raw = (win_rate * payoff_ratio - (1 - win_rate)) / payoff_ratio
+            if kelly_raw > 0:
+                # Half-Kelly for safety, capped at config max
+                kelly_fraction = min(kelly_raw * 0.5, max_pct)
+            else:
+                # Negative edge → use 25% of max until edge improves
+                kelly_fraction = max_pct * 0.25
+            logger.debug(
+                f"Kelly: p={win_rate:.2f} b={payoff_ratio:.2f} "
+                f"raw={kelly_raw:.3f} → half={kelly_fraction:.4f} (cap={max_pct:.3f})"
+            )
+        else:
+            kelly_fraction = max_pct  # fixed-fractional fallback
+
+        risk_amount = balance * kelly_fraction
         price_risk  = abs(entry_price - stop_price)
         if price_risk == 0:
             return 0.0

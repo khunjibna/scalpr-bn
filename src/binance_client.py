@@ -45,6 +45,19 @@ class BinanceClient:
             logger.error(f"Binance connection failed: {e}")
             raise
 
+    def is_connected(self) -> bool:
+        """Lightweight liveness probe — used by kill-switch (§8.2).
+
+        Returns True if `futures_ping` round-trips successfully.
+        Any exception (network, API, auth) → False.
+        """
+        try:
+            self.client.futures_ping()
+            return True
+        except Exception as exc:  # noqa: BLE001 — kill-switch must never crash on probe
+            logger.warning(f"Exchange connectivity check failed: {exc}")
+            return False
+
     # ── Balance ──────────────────────────────────────────────────────────────
 
     def get_futures_balance(self) -> float:

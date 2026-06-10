@@ -13,6 +13,7 @@ from sklearn.utils.parallel import Parallel  # noqa: F401 – ensures sklearn pa
 from .binance_client import BinanceClient
 from .database import TradeDB
 from .indicators import calculate_indicators, get_signal_from_indicators
+from .interfaces import Signal
 from .ml_strategy import MLStrategy
 from .risk_manager import RiskManager
 
@@ -48,6 +49,8 @@ class TradingBot:
         self.current_signal = 0
         self.ml_confidence  = 0.0
         self.ind_signal     = 0
+        # Ensemble conflict-resolution scalar (1.0 = no shrink, 0.0 = block)
+        self.ensemble_size_scalar = 1.0
         # Seed in-memory cache from DB (survives restarts)
         self.trade_history: list[dict] = (
             self.db.get_trades(100, self.symbol) if self.db else []
@@ -65,9 +68,13 @@ class TradingBot:
         # V2: signal expiry tracking
         self._last_signal_time: datetime | None = None
         self._signal_expiry_seconds: int = self.bot_cfg.get("signal_expiry_seconds", 300)
+        # Phase 3 §14.2: hold last standardized Signal for traceability + DB persistence
+        self.last_signal: Signal | None = None
 
         # Global margin guard — updated by BotManager each cycle
         self.free_margin: float | None = None
+        # Correlation block flag — updated by BotManager MarginUpdater (§8.1)
+        self.corr_blocked: bool = False
 
         self._setup_symbol()
 
@@ -138,10 +145,12 @@ class TradingBot:
             _det = self.strategy.drift_detector
             _min_obs = self.strategy.ml_cfg.get("drift_min_obs", 30)
             drift_score = _det.rolling_score() if len(_det._history) >= _min_obs else 0.0
+            # §8.2 cond. 5 — exchange connectivity probe (futures_ping)
+            exchange_ok = self.client.is_connected()
             ks_triggered, ks_reason = self.risk.check_kill_switch(
                 balance=balance,
                 ml_drift_score=drift_score,
-                exchange_connected=True,
+                exchange_connected=exchange_ok,
             )
             if ks_triggered:
                 logger.critical(f"Kill-switch triggered — halting: {ks_reason}")
@@ -175,7 +184,12 @@ class TradingBot:
 
             # Signals
             self.ind_signal               = get_signal_from_indicators(df, self.config)
-            ml_signal, self.ml_confidence = self.strategy.predict(df)
+            # Phase 3 §14.2: get standardized Signal object from strategy
+            signal_obj = self.strategy.emit_signal(df, self.symbol)
+            self.last_signal = signal_obj
+            ml_signal               = int(signal_obj.direction)
+            self.ml_confidence      = float(signal_obj.confidence)
+            self.ensemble_size_scalar = float(signal_obj.position_size_suggestion or 1.0)
 
             # V2: signal expiry — discard stale signals
             now = datetime.now()
@@ -238,6 +252,21 @@ class TradingBot:
             # ── Software SL/TP check ─────────────────────────────────────────
             sltp = self._sltp.get(self.symbol)
             if sltp:
+                # ── Break-even SL move (§7.2): lock in 0 once price moves +R·be ──
+                be_r = float(self.config.get("risk", {}).get("breakeven_at_r", 0.0))
+                if be_r > 0 and not sltp.get("be_armed", False):
+                    entry      = float(sltp.get("entry", price))
+                    initial_sl = float(sltp.get("initial_sl", sltp["sl"]))
+                    r_dist     = abs(entry - initial_sl)
+                    if r_dist > 0:
+                        moved = (price - entry) if sltp["side"] == "LONG" else (entry - price)
+                        if moved >= be_r * r_dist:
+                            sltp["sl"]       = entry
+                            sltp["be_armed"] = True
+                            logger.info(
+                                f"Break-even armed | {sltp['side']} @ {price:.4f} "
+                                f"moved {moved/r_dist:.2f}R → SL→entry {entry:.4f}"
+                            )
                 sl, tp, side = sltp["sl"], sltp["tp"], sltp["side"]
                 hit = None
                 if side == "LONG":
@@ -301,6 +330,11 @@ class TradingBot:
             logger.debug("Max positions reached — skip")
             return
 
+        # Correlation position limit guard (§8.1)
+        if self.corr_blocked:
+            logger.debug(f"{self.symbol}: skip — high correlation with existing open position")
+            return
+
         # Already in same-direction position guard
         for pos in positions:
             amt = float(pos["positionAmt"])
@@ -327,9 +361,23 @@ class TradingBot:
         sl  = self.risk.calculate_stop_loss(price, side, atr)
         tp  = self.risk.calculate_take_profit(price, sl, side)
 
-        # qty = risk_amount / sl_distance  (leverage is handled by the exchange)
-        # DO NOT multiply by leverage — that amplifies incorrectly
-        qty = self.risk.calculate_position_size(balance, price, sl)
+        # Kelly-adjusted position sizing (§7.1) — pass rolling stats if available
+        rolling      = self.strategy.get_rolling_metrics()
+        win_rate     = rolling.get("rolling_win_rate")
+        payoff_ratio = rolling.get("rolling_payoff_ratio")
+        qty = self.risk.calculate_position_size(
+            balance, price, sl, win_rate=win_rate, payoff_ratio=payoff_ratio
+        )
+
+        # Ensemble conflict-resolution scalar (§9.3) — shrink size if models disagree
+        scalar = float(getattr(self, "ensemble_size_scalar", 1.0) or 1.0)
+        scalar = max(0.0, min(scalar, 1.0))
+        if scalar < 0.999:
+            qty_before = qty
+            qty *= scalar
+            logger.info(
+                f"Ensemble agreement×{scalar:.2f}: qty {qty_before:.6f} → {qty:.6f}"
+            )
 
         # Hard cap: margin used per trade ≤ 20% of available balance
         margin_required = qty * price / self.leverage
@@ -371,12 +419,20 @@ class TradingBot:
             self.client.place_take_profit(self.symbol, exit_side, qty, tp)
         else:
             # Software-side SL/TP (works on testnet)
-            self._sltp[self.symbol] = {"sl": sl, "tp": tp, "side": side, "qty": qty}
+            self._sltp[self.symbol] = {
+                "sl": sl, "tp": tp, "side": side, "qty": qty,
+                "entry": entry, "initial_sl": sl, "be_armed": False,
+            }
             logger.info(f"Software SL/TP registered | SL={sl:.4f} TP={tp:.4f}")
 
         self._position_open_time = datetime.now()
 
         import uuid as _uuid
+        # Phase 3 §14.2: link trade ↔ Signal for full traceability
+        signal_id   = self.last_signal.signal_id  if self.last_signal else ""
+        signal_arch = self.last_signal.archetype  if self.last_signal else "scalper"
+        if self.last_signal:
+            logger.info(f"Signal → Trade | {self.last_signal.to_json()}")
         trade_record = {
             "uid":           str(_uuid.uuid4()),
             "id":            order.get("orderId", ""),
@@ -388,6 +444,8 @@ class TradingBot:
             "stop_loss":     sl,
             "take_profit":   tp,
             "ml_confidence": self.ml_confidence,
+            "signal_id":     signal_id,
+            "archetype":     signal_arch,
             "status":        "OPEN",
             "pnl":           0.0,
         }

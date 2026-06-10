@@ -6,7 +6,29 @@ import os
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
 warnings.filterwarnings("ignore", category=UserWarning, message=".*sklearn.utils.parallel.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*propagate the scikit-learn configuration.*")
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ── Nuclear option: monkey-patch sklearn _FuncWrapper to suppress parallel warning ─
+# Some sklearn 1.9+ code paths emit UserWarning from _FuncWrapper.__call__ when
+# delayed() is invoked without going through sklearn.utils.parallel.Parallel
+# (e.g. when joblib executes tasks across thread boundaries with n_jobs=1).
+# Filter rules may not always catch them across thread contexts, so we patch
+# the source to skip the warning emission entirely.
+try:
+    from sklearn.utils import parallel as _sk_parallel
+    _orig_funcwrapper_call = _sk_parallel._FuncWrapper.__call__
+
+    def _silent_funcwrapper_call(self, *args, **kwargs):
+        from sklearn import config_context
+        cfg = getattr(self, "config", None) or {}
+        with config_context(**cfg):
+            return self.function(*args, **kwargs)
+
+    _sk_parallel._FuncWrapper.__call__ = _silent_funcwrapper_call
+except Exception:
+    pass  # keep going if sklearn internals change
+
 from collections import deque
 from datetime import datetime
 
@@ -18,8 +40,10 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import StandardScaler
 
+from .ensemble import EnsembleModel
+
 # V2 Feature schema version — must match indicators.py
-FEATURE_SCHEMA_VERSION = "2.1"
+FEATURE_SCHEMA_VERSION = "2.2"  # 2.2 = ensemble (RF+GBM+ET)
 
 # V2 expanded feature set
 FEATURE_COLS = [
@@ -220,9 +244,12 @@ class MLStrategy:
         self.model_path  = self.ml_cfg.get("model_path", "models/rf_model.pkl")
         self.scaler_path = self.model_path.replace(".pkl", "_scaler.pkl")
         self.metrics_path = self.model_path.replace(".pkl", "_metrics.pkl")
+        # Ensemble lives next to the legacy model file with a distinct suffix
+        self.ensemble_path = self.model_path.replace(".pkl", "_ensemble.pkl")
 
-        self.model:  RandomForestClassifier | None = None
-        self.scaler: StandardScaler         | None = None
+        self.model:    RandomForestClassifier | None = None   # legacy fallback
+        self.scaler:   StandardScaler         | None = None   # legacy fallback
+        self.ensemble: EnsembleModel          | None = None
         self.drift_detector = _DriftDetector()
 
         self.last_trained: datetime | None = None
@@ -239,6 +266,30 @@ class MLStrategy:
     # ── Persistence ──────────────────────────────────────────────────────────
 
     def _load_model(self):
+        # Prefer ensemble model if present
+        if os.path.exists(self.ensemble_path):
+            try:
+                ens = EnsembleModel.load(self.ensemble_path)
+                saved_n = getattr(ens.scaler, "n_features_in_", None)
+                if saved_n is not None and saved_n != len(FEATURE_COLS):
+                    logger.warning(
+                        f"Stale ensemble discarded: saved={saved_n} features, "
+                        f"current schema={len(FEATURE_COLS)} — will retrain"
+                    )
+                    return
+                self.ensemble = ens
+                self.is_trained = True
+                if os.path.exists(self.metrics_path):
+                    self._last_validation_metrics = joblib.load(self.metrics_path)
+                logger.info(
+                    f"Ensemble loaded | schema={FEATURE_SCHEMA_VERSION} | "
+                    f"features={saved_n} | weights={ens.weights}"
+                )
+                return
+            except Exception as e:
+                logger.warning(f"Could not load ensemble: {e}")
+
+        # Legacy single-model fallback
         if os.path.exists(self.model_path) and os.path.exists(self.scaler_path):
             try:
                 model  = joblib.load(self.model_path)
@@ -259,19 +310,30 @@ class MLStrategy:
                 if os.path.exists(self.metrics_path):
                     self._last_validation_metrics = joblib.load(self.metrics_path)
                 logger.info(
-                    f"ML model loaded | schema={FEATURE_SCHEMA_VERSION} | "
-                    f"features={saved_n} | "
-                    f"metrics={self._last_validation_metrics.get('val_sharpe', 'n/a')}"
+                    f"Legacy single-model loaded | schema={FEATURE_SCHEMA_VERSION} | "
+                    f"features={saved_n} | will upgrade to ensemble on next retrain"
                 )
             except Exception as e:
                 logger.warning(f"Could not load model: {e}")
 
     def _save_model(self):
         os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-        joblib.dump(self.model,  self.model_path)
-        joblib.dump(self.scaler, self.scaler_path)
-        joblib.dump(self._last_validation_metrics, self.metrics_path)
-        logger.info(f"Model saved → {self.model_path}")
+        if self.ensemble is not None:
+            self.ensemble.save(self.ensemble_path)
+            joblib.dump(self._last_validation_metrics, self.metrics_path)
+            # Remove stale legacy single-model files to avoid confusion
+            for p in (self.model_path, self.scaler_path):
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+            logger.info(f"Ensemble saved → {self.ensemble_path}")
+        else:
+            joblib.dump(self.model,  self.model_path)
+            joblib.dump(self.scaler, self.scaler_path)
+            joblib.dump(self._last_validation_metrics, self.metrics_path)
+            logger.info(f"Model saved → {self.model_path}")
 
     # ── Data preparation ─────────────────────────────────────────────────────
 
@@ -285,22 +347,120 @@ class MLStrategy:
         future_ret = df["close"].shift(-lookahead) / df["close"] - 1
         return (future_ret > 0).astype(int)
 
+    @staticmethod
+    def _denoise_mask(df: pd.DataFrame, lookahead: int,
+                      min_move_atr: float) -> pd.Series:
+        """Return boolean mask of samples whose |future_ret| ≥ min_move_atr × ATR%.
+        Used to drop ambiguous "noise" bars from training so the ML model
+        only learns directional moves larger than typical bar volatility.
+        min_move_atr=0 disables the filter.
+        """
+        if min_move_atr <= 0 or "atr_14" not in df.columns:
+            return pd.Series(True, index=df.index)
+        future_ret = (df["close"].shift(-lookahead) / df["close"] - 1).abs()
+        atr_pct    = df["atr_14"] / df["close"]
+        threshold  = atr_pct * min_move_atr
+        return future_ret >= threshold
+
     # ── Single-seed training ──────────────────────────────────────────────────
 
-    def _train_single_seed(self, X_train, y_train, X_val, y_val, seed: int) -> dict:
+    # ── Optuna hyperparameter search (handbook §4.2) ────────────────────────
+
+    def _optuna_hp_search(self, X_train: np.ndarray, y_train: np.ndarray,
+                          X_val: np.ndarray, y_val: np.ndarray,
+                          n_trials: int = 50) -> dict:
+        """Optuna hyperparameter search for RandomForest (handbook §4.2).
+        Returns best params dict (empty dict on error / optuna not installed)."""
+        try:
+            import optuna
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+        except ImportError:
+            logger.warning("optuna not installed — skipping HP search (pip install optuna)")
+            return {}
+
+        from sklearn import config_context, get_config
+        _sk_cfg = get_config()   # capture current thread's sklearn config
+
+        def _objective(trial):
+            params = {
+                "n_estimators":     trial.suggest_int("n_estimators", 50, 400),
+                "max_depth":        trial.suggest_int("max_depth", 4, 20),
+                "min_samples_leaf": trial.suggest_int("min_samples_leaf", 5, 40),
+                "max_features":     trial.suggest_categorical("max_features", ["sqrt", "log2"]),
+            }
+            with config_context(**_sk_cfg):   # propagate sklearn config → suppress warning
+                sc  = StandardScaler()
+                Xtr = sc.fit_transform(X_train)
+                Xva = sc.transform(X_val)
+                clf = RandomForestClassifier(**params, n_jobs=1, random_state=42)
+                clf.fit(Xtr, y_train)
+            pnl = _simulate_pnl(y_val, clf.predict(Xva))
+            return _compute_sharpe(pnl)
+
+        study = optuna.create_study(direction="maximize")
+        study.optimize(_objective, n_trials=n_trials, show_progress_bar=False)
+        best = study.best_params
+        logger.info(f"Optuna HP search | best={best} | sharpe={study.best_value:.3f}")
+        return best
+
+    # ── Regime-stratified evaluation (handbook §5.2) ─────────────────────
+
+    @staticmethod
+    def _regime_labels(X: np.ndarray) -> np.ndarray:
+        """Label bars as 0=ranging / 1=trending via ATR relative to median."""
+        try:
+            atr_idx = FEATURE_COLS.index("atr_14")
+            vol = np.abs(X[:, atr_idx])
+        except (ValueError, IndexError):
+            vol = np.std(X, axis=1)
+        return (vol > np.median(vol)).astype(int)
+
+    def _regime_eval(self, X_val: np.ndarray, y_val: np.ndarray,
+                     model, scaler) -> dict:
+        """Evaluate model Sharpe / win-rate per market regime (handbook §5.2)."""
+        Xva_s  = scaler.transform(X_val)
+        y_pred = model.predict(Xva_s)
+        pnl    = _simulate_pnl(y_val, y_pred)
+        regimes = self._regime_labels(X_val)
+        result: dict = {}
+        for regime_id, name in [(0, "ranging"), (1, "trending")]:
+            mask = regimes == regime_id
+            if mask.sum() < 10:
+                continue
+            r_pnl = pnl[mask]
+            result[name] = {
+                "n":        int(mask.sum()),
+                "sharpe":   round(_compute_sharpe(r_pnl), 3),
+                "win_rate": round(_compute_win_rate(r_pnl), 3),
+            }
+        return result
+
+    # ── Single-seed training ────────────────────────────────────────────────
+
+    def _train_single_seed(self, X_train, y_train, X_val, y_val, seed: int,
+                           hp_overrides: dict | None = None) -> dict:
         np.random.seed(seed)
         scaler = StandardScaler()
         Xtr_s  = scaler.fit_transform(X_train)
         Xva_s  = scaler.transform(X_val)
 
+        params = {
+            "n_estimators":     self.ml_cfg.get("n_estimators", 200),
+            "max_depth":        10,
+            "min_samples_leaf": 10,
+            "max_features":     "sqrt",
+        }
+        if hp_overrides:
+            params.update(hp_overrides)
+
         model = RandomForestClassifier(
-            n_estimators=self.ml_cfg.get("n_estimators", 200),
-            max_depth=10,
-            min_samples_leaf=10,
+            **params,
             n_jobs=1,   # single-thread: avoids sklearn parallel config warning
             random_state=seed,
         )
-        model.fit(Xtr_s, y_train)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            model.fit(Xtr_s, y_train)
 
         val_pred = model.predict(Xva_s)
         val_acc  = float(accuracy_score(y_val, val_pred))
@@ -377,10 +537,22 @@ class MLStrategy:
 
         min_samples = self.ml_cfg.get("min_train_samples", 200)
         lookahead   = self.ml_cfg.get("lookahead_candles", 3)
+        min_move    = float(self.ml_cfg.get("min_move_atr", 0.0))
 
         feat_df  = self._features(df)
         labels   = self._labels(df, lookahead=lookahead)
-        combined = pd.concat([feat_df, labels.rename("label")], axis=1).dropna()
+        keep     = self._denoise_mask(df, lookahead=lookahead, min_move_atr=min_move)
+        combined = pd.concat(
+            [feat_df, labels.rename("label"), keep.rename("_keep")], axis=1
+        ).dropna()
+        n_before = len(combined)
+        combined = combined[combined["_keep"]].drop(columns=["_keep"])
+        if min_move > 0 and n_before:
+            kept_pct = len(combined) / n_before * 100
+            logger.info(
+                f"Label denoise | min_move={min_move:.2f}×ATR | "
+                f"kept {len(combined)}/{n_before} ({kept_pct:.1f}%)"
+            )
 
         if len(combined) < min_samples:
             logger.warning(f"Samples: {len(combined)} < {min_samples} — using all available")
@@ -409,11 +581,20 @@ class MLStrategy:
             logger.error(f"Data validation failed: {e}")
             return False
 
-        # ── Multi-seed training ───────────────────────────────────────────────
+        # ── Optuna HP search (§4.2) ──────────────────────────────────────
+        n_trials = self.ml_cfg.get("optuna_trials", 50)
+        best_hp: dict = {}
+        if n_trials > 0:
+            best_hp = self._optuna_hp_search(X_train, y_train, X_val, y_val,
+                                             n_trials=n_trials)
+
+        # ── Multi-seed training ──────────────────────────────────────────
         seed_results = {}
         for seed in TRAINING_SEEDS:
             try:
-                res = self._train_single_seed(X_train, y_train, X_val, y_val, seed)
+                res = self._train_single_seed(
+                    X_train, y_train, X_val, y_val, seed, hp_overrides=best_hp
+                )
                 seed_results[seed] = res
                 logger.info(
                     f"Seed {seed} | acc={res['val_acc']:.3f} | "
@@ -471,24 +652,66 @@ class MLStrategy:
                 f"V2 gates PASSED | sharpe={best['val_sharpe']:.3f} | "
                 f"acc={best['val_acc']:.3f} | calmar={best['val_calmar']:.3f}"
             )
+        # ── Regime-stratified eval (§5.2) ────────────────────────────────────
+        regime_metrics = self._regime_eval(X_val, y_val, best["model"], best["scaler"])
+        for regime, rm in regime_metrics.items():
+            logger.info(
+                f"Regime [{regime}] n={rm['n']} | "
+                f"sharpe={rm['sharpe']:.3f} | win_rate={rm['win_rate']:.3f}"
+            )
+        # ── Build ensemble (handbook §9) ─────────────────────────────────────
+        ensemble = EnsembleModel()
+        try:
+            ens_metrics = ensemble.fit(
+                X_train, y_train, X_val, y_val,
+                seed=best_seed, hp_overrides=best_hp,
+                pnl_fn=_simulate_pnl, sharpe_fn=_compute_sharpe,
+            )
+            logger.success(
+                "Ensemble fitted | "
+                + " | ".join(
+                    f"{n}=sharpe {m['sharpe']:.2f}" for n, m in ens_metrics.items()
+                )
+            )
+        except Exception as e:
+            logger.error(f"Ensemble training failed, falling back to single model: {e}")
+            ensemble = None
 
         # ── Fit drift detector ────────────────────────────────────────────────
         self.drift_detector.fit(X_train)
 
         # ── Commit model ──────────────────────────────────────────────────────
-        self.model  = best["model"]
-        self.scaler = best["scaler"]
+        if ensemble is not None and ensemble.members:
+            self.ensemble = ensemble
+            self.model    = None   # ensemble supersedes legacy single model
+            self.scaler   = None
+        else:
+            self.model    = best["model"]
+            self.scaler   = best["scaler"]
+            self.ensemble = None
+
         self._last_validation_metrics = {
             k: v for k, v in best.items() if k not in ("model", "scaler")
         }
         self._last_validation_metrics["wf_sharpe_variance"] = wf_var
         self._last_validation_metrics["gates_passed"]       = passed
         self._last_validation_metrics["gate_failures"]      = failures
+        if self.ensemble is not None:
+            self._last_validation_metrics["ensemble_weights"] = dict(self.ensemble.weights)
+            self._last_validation_metrics["ensemble_members"] = self.ensemble.member_metrics
 
-        # Test-set report
+        # Test-set report (use ensemble if available, else legacy model)
         if len(X_test) >= 10:
-            Xte_s     = self.scaler.transform(X_test)
-            te_pred   = self.model.predict(Xte_s)
+            if self.ensemble is not None:
+                Xte_s   = self.ensemble.scaler.transform(X_test)
+                # Weighted hard-label vote
+                probs_up = np.zeros(len(X_test))
+                for n, mdl in self.ensemble.members.items():
+                    probs_up += self.ensemble.weights.get(n, 0.0) * mdl.predict_proba(Xte_s)[:, 1]
+                te_pred = (probs_up >= 0.5).astype(int)
+            else:
+                Xte_s   = self.scaler.transform(X_test)
+                te_pred = self.model.predict(Xte_s)
             te_pnl    = _simulate_pnl(y_test, te_pred)
             logger.info(
                 f"Test-set | acc={accuracy_score(y_test, te_pred):.3f} | "
@@ -506,17 +729,21 @@ class MLStrategy:
     def predict(self, df: pd.DataFrame) -> tuple:
         """
         Predict direction from the latest row of `df`.
-        Returns (signal, confidence) where signal ∈ {1, -1, 0}.
+        Returns (signal, confidence, size_scalar) where:
+            signal      ∈ {1, -1, 0}
+            confidence  ∈ [0, 1]
+            size_scalar ∈ [0, 1] — ensemble agreement multiplier (1.0 for legacy model)
         Runs feature drift check on the last 100 rows.
         """
-        if not self.is_trained or self.model is None:
-            return 0, 0.0
+        if not self.is_trained or (self.ensemble is None and self.model is None):
+            return 0, 0.0, 0.0
 
         threshold = self.ml_cfg.get("confidence_threshold", 0.58)
+        min_agree = self.ml_cfg.get("ensemble_min_agree", 2)
         feat_df   = self._features(df)
 
         if feat_df.empty or feat_df.isnull().any().any():
-            return 0, 0.0
+            return 0, 0.0, 0.0
 
         # Drift check on recent window
         drift_threshold = self.ml_cfg.get("drift_threshold", 0.15)
@@ -529,21 +756,38 @@ class MLStrategy:
             )
 
         latest = feat_df.iloc[-1:].values
+
+        # ── Ensemble path (preferred) ────────────────────────────────────────
+        if self.ensemble is not None:
+            try:
+                signal, conf, agreement, size_scalar, probs = self.ensemble.predict_consensus(
+                    latest, conf_threshold=threshold, min_agree=min_agree,
+                )
+                logger.debug(
+                    f"Ensemble vote | probs={ {k: round(v, 2) for k, v in probs.items()} } "
+                    f"| conf={conf:.2f} | agree={agreement:.2f} | size×{size_scalar:.2f}"
+                )
+                return signal, conf, size_scalar
+            except Exception as e:
+                logger.error(f"Ensemble prediction error: {e}")
+                return 0, 0.0, 0.0
+
+        # ── Legacy single-model fallback ─────────────────────────────────────
         try:
             scaled = self.scaler.transform(latest)
             proba  = self.model.predict_proba(scaled)[0]
         except Exception as e:
             logger.error(f"Prediction error: {e}")
-            return 0, 0.0
+            return 0, 0.0, 0.0
 
         prob_up   = float(proba[1])
         prob_down = float(proba[0])
 
         if prob_up   >= threshold:
-            return  1, prob_up
+            return  1, prob_up,   1.0
         if prob_down >= threshold:
-            return -1, prob_down
-        return 0, max(prob_up, prob_down)
+            return -1, prob_down, 1.0
+        return 0, max(prob_up, prob_down), 0.0
 
     # ── Rolling performance tracking ──────────────────────────────────────────
 
@@ -551,15 +795,47 @@ class MLStrategy:
         """Call after each trade closes to feed rolling metrics."""
         self._trade_pnl_history.append(pnl)
 
+    # ── §14.2 standardised Signal emission ────────────────────────────────────
+
+    def emit_signal(self, df: pd.DataFrame, symbol: str) -> "object":
+        """Return a §14.2-compliant Signal from the latest row.
+        Always returns a Signal (neutral when not trained / no consensus).
+        Imported lazily so we don't introduce a hard import cycle.
+        """
+        from datetime import datetime, timezone
+        from .interfaces import Signal
+
+        sig, conf, size_scalar = self.predict(df) if self.is_trained else (0, 0.0, 0.0)
+        backend = "ensemble" if self.ensemble is not None else (
+            "sklearn_rf" if self.model is not None else "none"
+        )
+        version = "ensemble_v1" if self.ensemble is not None else FEATURE_SCHEMA_VERSION
+        return Signal(
+            timestamp=datetime.now(timezone.utc),
+            archetype="ensemble" if self.ensemble is not None else "scalper",
+            symbol=symbol,
+            direction=float(sig),
+            confidence=float(conf),
+            model_name="MLStrategy",
+            model_version=version,
+            ensemble_size=len(self.ensemble.members) if self.ensemble else 1,
+            ensemble_entropy=float(1.0 - size_scalar),
+            features_version=FEATURE_SCHEMA_VERSION,
+            backend=backend,
+            inference_latency_ms=0.0,
+            position_size_suggestion=float(size_scalar),
+        )
+
     def get_rolling_metrics(self) -> dict:
         pnl_arr = np.array(self._trade_pnl_history)
         if len(pnl_arr) < 5:
             return {"rolling_sharpe": None, "rolling_win_rate": None,
                     "drift_score": None}
         return {
-            "rolling_sharpe":   _compute_sharpe(pnl_arr),
-            "rolling_win_rate": _compute_win_rate(pnl_arr),
-            "drift_score":      self.drift_detector.rolling_score(),
+            "rolling_sharpe":        _compute_sharpe(pnl_arr),
+            "rolling_win_rate":      _compute_win_rate(pnl_arr),
+            "rolling_payoff_ratio":  _compute_payoff_ratio(pnl_arr),
+            "drift_score":           self.drift_detector.rolling_score(),
         }
 
     # ── Retraining triggers ───────────────────────────────────────────────────

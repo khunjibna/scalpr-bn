@@ -3,6 +3,7 @@ import copy
 import os
 import threading
 
+import numpy as np
 from loguru import logger
 
 from .binance_client import BinanceClient
@@ -59,20 +60,65 @@ class BotManager:
     def _margin_updater(self):
         """Background thread: compute portfolio free margin and push to all bots."""
         import time
+        _last_corr_check = 0.0
+        _CORR_INTERVAL   = 60.0   # re-check correlations every 60 s
+        max_corr = self.config.get("risk", {}).get("max_corr_threshold", 0.85)
+
         while True:
             try:
                 balance = self._client.get_futures_balance()
                 # Sum margin in use across all open positions
                 used = 0.0
+                open_symbols: list[str] = []
                 for bot in self.bots.values():
                     for pos in self._client.get_positions(bot.symbol):
-                        notional = abs(float(pos.get("notional", 0)))
-                        leverage = float(pos.get("leverage", 1)) or 1
-                        used += notional / leverage
+                        if abs(float(pos.get("positionAmt", 0))) > 0:
+                            notional = abs(float(pos.get("notional", 0)))
+                            leverage = float(pos.get("leverage", 1)) or 1
+                            used += notional / leverage
+                            open_symbols.append(bot.symbol)
                 free = max(0.0, balance - used)
                 for bot in self.bots.values():
                     bot.free_margin = free
-                logger.debug(f"Portfolio margin | balance={balance:.2f} used={used:.2f} free={free:.2f}")
+                logger.debug(
+                    f"Portfolio margin | balance={balance:.2f} "
+                    f"used={used:.2f} free={free:.2f}"
+                )
+
+                # ── Correlation position limit (§8.1) ────────────────────────────
+                now = time.time()
+                if open_symbols and (now - _last_corr_check) >= _CORR_INTERVAL:
+                    _last_corr_check = now
+                    returns: dict[str, np.ndarray] = {}
+                    for sym in set(open_symbols) | set(self.bots.keys()):
+                        try:
+                            df = self._client.get_klines(sym, "1m", limit=60)
+                            if not df.empty:
+                                returns[sym] = df["close"].pct_change().dropna().values
+                        except Exception:
+                            pass
+                    corr_blocked: set[str] = set()
+                    for sym in self.bots:
+                        if sym in open_symbols or sym not in returns:
+                            continue
+                        for open_sym in open_symbols:
+                            if open_sym not in returns:
+                                continue
+                            r1, r2 = returns[sym], returns[open_sym]
+                            min_len = min(len(r1), len(r2))
+                            if min_len < 20:
+                                continue
+                            corr = float(np.corrcoef(r1[-min_len:], r2[-min_len:])[0, 1])
+                            if abs(corr) >= max_corr:
+                                corr_blocked.add(sym)
+                                logger.debug(
+                                    f"Corr block: {sym} ↔ {open_sym} "
+                                    f"corr={corr:.2f} ≥ {max_corr}"
+                                )
+                                break
+                    for bot in self.bots.values():
+                        bot.corr_blocked = bot.symbol in corr_blocked
+
             except Exception as e:
                 logger.warning(f"MarginUpdater error: {e}")
             time.sleep(5)  # update every 5 s

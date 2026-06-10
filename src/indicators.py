@@ -3,8 +3,9 @@ import numpy as np
 import pandas as pd
 import ta
 
-# V2 feature schema version — increment when features change
-FEATURE_SCHEMA_VERSION = "2.1"
+# V2 feature schema version — must match src/ml_strategy.py
+# 2.2 = ensemble (RF+GBM+ET) + standardized Signal/ExecutionOrder interfaces
+FEATURE_SCHEMA_VERSION = "2.2"
 
 
 def calculate_indicators(df: pd.DataFrame, config: dict) -> pd.DataFrame:

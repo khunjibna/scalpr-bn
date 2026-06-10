@@ -34,6 +34,8 @@ class Trade:
     stop_loss:     float
     take_profit:   float
     ml_confidence: float
+    initial_sl:    float = 0.0
+    be_armed:      bool  = False
     exit_time:     Optional[pd.Timestamp] = None
     exit_price:    Optional[float]        = None
     exit_reason:   str                    = ""
@@ -62,6 +64,8 @@ class BacktestResult:
     profit_factor:    float = 0.0
     max_drawdown_pct: float = 0.0
     sharpe_ratio:     float = 0.0
+    total_fees:       float = 0.0
+    exit_reasons:     dict  = field(default_factory=dict)
     equity_curve:     list  = field(default_factory=list)
 
 
@@ -74,6 +78,9 @@ class Backtester:
         self.risk_cfg        = config.get("risk", {})
         self.trading_cfg     = config.get("trading", {})
         self.leverage        = self.trading_cfg.get("leverage", 10)
+        # Binance USDT-M Futures taker fee ≈ 0.04%; round-trip = entry + exit.
+        # Override via trading.fee_rate in config.yaml if needed.
+        self.fee_rate        = float(self.trading_cfg.get("fee_rate", 0.0004))
 
     def run(self, df_raw: pd.DataFrame, symbol: str) -> BacktestResult:
         """
@@ -110,6 +117,7 @@ class Backtester:
         sl_pct    = self.risk_cfg.get("stop_loss_pct",    0.004)
         rr        = self.risk_cfg.get("take_profit_ratio", 1.5)
         risk_frac = self.risk_cfg.get("max_position_pct", 0.02)
+        be_r      = float(self.risk_cfg.get("breakeven_at_r", 0.0))
         max_hold  = self.config.get("strategy", {}).get("max_hold_candles", 10)
         conf_thr  = self.config.get("ml", {}).get("confidence_threshold", 0.60)
 
@@ -132,8 +140,16 @@ class Backtester:
 
             # ── Check open trade ──────────────────────────────────────────────
             if open_trade is not None:
-                t   = open_trade
-                hit = None
+                t   = open_trade                # Break-even SL move: lock in zero loss after +be_r · R move
+                if be_r > 0 and not t.be_armed:
+                    r_dist = abs(t.entry_price - t.initial_sl)
+                    if r_dist > 0:
+                        favourable = (high - t.entry_price) if t.side == "LONG" \
+                                     else (t.entry_price - low)
+                        if favourable >= be_r * r_dist:
+                            t.stop_loss = t.entry_price
+                            t.be_armed  = True   
+                            hit = None
                 if t.side == "LONG":
                     if low  <= t.stop_loss:    hit = ("SL", t.stop_loss)
                     elif high >= t.take_profit: hit = ("TP", t.take_profit)
@@ -149,6 +165,9 @@ class Backtester:
                     reason, exit_px = hit
                     pnl = ((exit_px - t.entry_price) if t.side == "LONG"
                            else (t.entry_price - exit_px)) * t.qty * self.leverage
+                    # Round-trip taker fees (entry notional + exit notional) × fee_rate
+                    fee = (t.entry_price + exit_px) * t.qty * self.fee_rate
+                    pnl -= fee
                     pnl_pct = pnl / balance * 100
                     t.exit_time   = ts
                     t.exit_price  = exit_px
@@ -165,8 +184,13 @@ class Backtester:
 
             # ── Generate signal (every bar, no slicing overhead) ──────────────
             window = test_df.iloc[max(0, i - 100): i + 1]
-            ind_signal           = get_signal_from_indicators(window, self.config)
-            ml_signal, confidence = ml.predict(window)
+            ind_signal = get_signal_from_indicators(window, self.config)
+            pred = ml.predict(window)
+            # Back-compat: ensemble returns 3-tuple, legacy returns 2-tuple
+            if len(pred) == 3:
+                ml_signal, confidence, _size_scalar = pred
+            else:
+                ml_signal, confidence = pred
 
             signal = ml_signal if (ind_signal == ml_signal != 0) else 0
             if signal == 0 or confidence < conf_thr:
@@ -193,6 +217,7 @@ class Backtester:
                 entry_time=ts, symbol=symbol, side=side,
                 entry_price=price, qty=qty,
                 stop_loss=sl, take_profit=tp,
+                initial_sl=sl,
                 ml_confidence=confidence,
             )
             entry_bar_i = i
@@ -204,6 +229,8 @@ class Backtester:
             t = open_trade
             pnl = ((last_price - t.entry_price) if t.side == "LONG"
                    else (t.entry_price - last_price)) * t.qty * self.leverage
+            fee = (t.entry_price + last_price) * t.qty * self.fee_rate
+            pnl -= fee
             t.exit_time   = test_df.index[-1]
             t.exit_price  = last_price
             t.exit_reason = "END"
@@ -247,6 +274,20 @@ def _analyse(r: BacktestResult) -> BacktestResult:
     gross_profit = sum(wins)
     gross_loss   = abs(sum(losses))
     r.profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    # Fee summary (sum of entry+exit fees; estimated from notional & fee_rate)
+    # Each trade's fee is implicit in pnl now; reconstruct for transparency.
+    fee_total = 0.0
+    for t in trades:
+        if t.exit_price is None:
+            continue
+        # Approx — mirrors the deduction made during simulation
+        fee_total += (t.entry_price + t.exit_price) * t.qty * 0.0004
+    r.total_fees = fee_total
+
+    # Exit reason distribution (SL / TP / TIME / END)
+    from collections import Counter
+    r.exit_reasons = dict(Counter(t.exit_reason for t in trades))
 
     # Max drawdown
     eq  = np.array(r.equity_curve)

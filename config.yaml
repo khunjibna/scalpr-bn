@@ -16,16 +16,18 @@ trading:
     - TRXUSDT    # 11 TRON           — market cap top 10, high tx volume
     - NEARUSDT   # 12 NEAR Protocol  — market cap top 20, consistent volume
   timeframe: 1m             # 1m สำหรับ scalping (3m ก็ได้ถ้า noise เยอะเกิน)
-  leverage: 5               # $5,000: 5x — liquidation ห่าง ~20% (เดิม 10x สำหรับ $300)
+  leverage: 3               # ลด 5→3: backtest แสดง DD พุ่งจาก 10%→71% เมื่อ 3x→10x
   margin_type: ISOLATED
   testnet: true
   simulated_balance: null  # null = ดึง balance จริงจาก Binance
                             # ตั้งเป็น 300.0 หรือ 5000.0 เพื่อ override
+  fee_rate: 0.0004          # Binance USDT-M Futures taker = 0.04% (round-trip = 0.08%)
 risk:
   # ── $5,000 portfolio settings ────────────────────────────────────────────
   max_position_pct: 0.01      # 1% × $5,000 = $50/เทรด  (เดิม 0.02 = $6 สำหรับ $300)
   stop_loss_pct: 0.005        # SL 0.5% — กว้างกว่า noise 1m  (เดิม 0.004)
-  take_profit_ratio: 2.0      # R:R 2:1 → TP = 1.0%  (เดิม 1.5)
+  take_profit_ratio: 1.0      # R:R 1:1 → TP 0.5% เท่า SL (เดิม 2.0 ทำให้ TIME exit มากกว่า TP 4-5×)
+  breakeven_at_r: 0.5         # เลื่อน SL ขึ้นที่จุดทุนเมื่อราคาวิ่ง +0.5R → ลด loss จาก TIME exit
   max_daily_loss_pct: 0.03    # หยุดถ้าขาดทุนเกิน 3% = $150/วัน  (เดิม 0.06 สำหรับ $300)
   max_open_positions: 1
 
@@ -46,12 +48,13 @@ risk:
 
   # ── V2 Portfolio-level guards (handbook §8) ────────────────────────────────
   max_portfolio_dd: 0.15      # หยุดถ้า portfolio drawdown เกิน 15% = $750  (เดิม 0.25)
-  max_leverage: 5.0           # Leverage cap  (เดิม 3.0)
+  max_leverage: 3.0           # Leverage cap = 3.0 (เดิม 5.0)
   max_position_per_symbol: 0.05   # Max 5% of equity per symbol (notional)
   rolling_window: 50          # จำนวน trades สำหรับ rolling Sharpe / win-rate
   drift_kill_threshold: 3.0   # KL > 3.0 → kill-switch (ต้องเห็น ≥30 cycles ก่อน)
                               # ค่า KL สูตรนี้: volatility 2x ≈ 0.8 ต่อ feature
                               # KL 3.0 ≈ drift รุนแรงมาก (~5x vol หรือ mean shift ใหญ่)
+  max_corr_threshold: 0.85  # §8.1 บล็อก symbol ใหม่ถ้า corr ≥ 0.85 กับ position ที่เปิดอยู่
 
 strategy:
   # ── ใช้ EMA เร็วกว่าปกติสำหรับ scalping ──────────────────────────────────
@@ -67,7 +70,7 @@ strategy:
 
   # ── Scalping-specific ─────────────────────────────────────────────────────
   volume_spike_mult: 1.5    # volume spike ≥ 1.5× avg = confirm signal
-  max_hold_candles: 10      # บังคับปิด position ถ้าถือเกิน 10 candle (10 นาที)
+  max_hold_candles: 15      # ขยายจาก 10 → 15 เพื่อให้ TP มีโอกาสโดนก่อน TIME exit
 
 ml:
   model_path: models/rf_model.pkl
@@ -75,16 +78,35 @@ ml:
   lookback_candles: 1500
   min_train_samples: 150      # ลดลงให้ train ได้ด้วย 1500 candle × 1m
   lookahead_candles: 3      # predict 3 candle ข้างหน้า (3 นาที)
-  confidence_threshold: 0.60
+  min_move_atr: 0.5         # §denoise: drop training labels ที่ |future_ret| < 0.5×ATR (กรอง noise → ML เรียน directional moves)
+  confidence_threshold: 0.62  # ขยับจาก 0.60 → 0.62: ลด false-positive จาก noise ของ 1m
   n_estimators: 200
   rolling_window: 50        # จำนวน trades สำหรับ rolling Sharpe / win-rate trigger
+  optuna_trials: 50         # §4.2 HP search (เพิ่ม 20→50 — แลกเวลา ~2x ต่อ symbol)
+  ensemble_min_agree: 2     # §9/§11.3 ต้องมีอย่างน้อย N/3 model agree (1=disable, 2=majority, 3=unanimous)
 
   # ── V2 retraining thresholds (handbook §12.3) ────────────────────────────
   drift_threshold: 1.0      # KL divergence > 1.0 → retrain (~2x volatility change)
   drift_min_obs: 30         # ต้องเห็น ≥30 cycles ก่อนที่ drift score จะ feed kill-switch
   min_rolling_sharpe: 0.5   # Rolling Sharpe < 0.5 → retrain
   min_rolling_win_rate: 0.40  # Rolling win-rate < 40% → retrain
-
+  # ── APV-PLN (§APV-PLN) — Phase 3 neural net upgrade ─────────────────────
+  apv_pln:
+    enabled: false            # set true หลัง train + ติดตั้ง torch แล้ว
+    backend: cpu              # cpu | cuda | directml
+    weights_path: models/apv_pln_v1.pt
+    seq_len: 32               # จำนวน bars ย้อนหลังที่ป้อน model
+    horizon: 5                # bars จะ predict ข้างหน้า (oracle privileged window)
+    cnn_channels: 64          # 64 = APV_PLN_v1; 128 = v2
+    nhead: 4                  # 4 = v1/v2; 8 = v3
+    dropout: 0.15
+    epochs: 20
+    batch_size: 64
+    lr: 0.001
+    alpha: 0.5                # CE weight
+    beta: 0.5                 # KL weight
+    temperature: 2.0          # distillation T
+    consensus_weight: 0.0     # 0.0 = APV-PLN ยังไม่ได้ vote (รอ Phase 4)
 dashboard:
   host: 0.0.0.0
   port: 8080

@@ -12,3 +12,9 @@ pyyaml>=6.0.1
 requests>=2.31.0
 pyarrow>=14.0.0
 matplotlib>=3.8.0
+optuna>=3.0.0
+
+# ── Optional: APV-PLN (Phase 3 neural net upgrade, §APV-PLN) ───────────────
+# Uncomment if running ml.apv_pln.enabled=true in config.yaml.
+# torch>=2.2.0
+# torch-directml>=0.2.4   ; sys_platform == 'win32'  # AMD/Intel GPU on Windows

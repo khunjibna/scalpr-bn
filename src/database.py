@@ -20,7 +20,7 @@ trades:
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from loguru import logger
@@ -126,7 +126,7 @@ class TradeDB:
 
     def get_daily_pnl(self, symbol: str | None = None) -> float:
         """Sum of realized PnL for closed trades opened today (UTC date)."""
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         with self._lock:
             if symbol:
                 row = self._con.execute(

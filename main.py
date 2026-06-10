@@ -17,6 +17,8 @@ import sys
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*sklearn.utils.parallel.*")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*propagate the scikit-learn configuration.*")
 
 import yaml
 from dotenv import load_dotenv
