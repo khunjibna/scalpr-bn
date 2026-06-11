@@ -1,8 +1,10 @@
 """Binance Futures API wrapper"""
 import math
 import os
+import time
 
 import pandas as pd
+import requests
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from loguru import logger
@@ -21,6 +23,8 @@ class BinanceClient:
 
         self.testnet = testnet
         self._simulated_balance: float | None = simulated_balance
+        self._time_offset: int = 0  # milliseconds offset from server time
+        
         if testnet:
             self.client = Client(
                 api_key, api_secret,
@@ -35,6 +39,12 @@ class BinanceClient:
         else:
             self.client = Client(api_key, api_secret)
             logger.info("🔴 LIVE MODE — ใช้เงินจริง")
+        
+        # Set recvWindow for timestamp tolerance (5 seconds)
+        self.client.REQUEST_TIMEOUT = 10
+        self.request_timeout = 10
+        
+        self._sync_time()
         self._test_connection()
 
     def _test_connection(self):
@@ -44,6 +54,28 @@ class BinanceClient:
         except BinanceAPIException as e:
             logger.error(f"Binance connection failed: {e}")
             raise
+
+    def _sync_time(self):
+        """Sync local time with Binance server time to prevent -1021 errors.
+
+        Sets client.timestamp_offset — the official python-binance mechanism
+        used internally on every signed request:
+          timestamp = int(time.time() * 1000 + self.timestamp_offset)
+        """
+        try:
+            base_url = "https://fapi.binance.com/fapi"
+            response = requests.get(f"{base_url}/v1/time", timeout=5)
+            response.raise_for_status()
+            server_time = response.json()["serverTime"]
+            local_time = int(time.time() * 1000)
+            offset = server_time - local_time
+            self.client.timestamp_offset = offset
+            self._time_offset = offset
+            logger.info(f"Time sync: offset={offset}ms (local is {'behind' if offset > 0 else 'ahead of'} server)")
+        except Exception as e:
+            logger.warning(f"Failed to sync time with server: {e} — using local time")
+            self.client.timestamp_offset = 0
+            self._time_offset = 0
 
     def is_connected(self) -> bool:
         """Lightweight liveness probe — used by kill-switch (§8.2).

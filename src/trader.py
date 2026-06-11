@@ -82,6 +82,8 @@ class TradingBot:
 
     def _setup_symbol(self):
         try:
+            # Resync time before setting symbol parameters
+            self.client._sync_time()
             self.client.set_margin_type(self.symbol, self.margin_type)
             self.client.set_leverage(self.symbol, self.leverage)
             self.step_size = self.client.get_step_size(self.symbol)
